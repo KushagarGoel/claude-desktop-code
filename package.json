@@ -1,0 +1,15 @@
+{
+  "name": "claude-here",
+  "version": "1.0.0",
+  "description": "Instantly connect Claude Desktop to your current project directory via MCP",
+  "type": "module",
+  "bin": {
+    "claude-here": "./bin/cli.js"
+  },
+  "files": [
+    "bin/",
+    "src/"
+  ],
+  "keywords": ["claude", "mcp", "ai", "filesystem", "developer-tools"],
+  "license": "MIT"
+}
