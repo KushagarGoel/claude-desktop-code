@@ -1,8 +1,9 @@
 {
   "name": "claude-web",
   "version": "1.0.0",
-  "description": "Instantly connect Claude Desktop to any project via MCP — one command, from anywhere",
+  "description": "Connect Claude Desktop to any project instantly — one command, filesystem + terminal access via MCP",
   "type": "module",
+  "main": "./bin/cli.js",
   "bin": {
     "claude-web": "./bin/cli.js"
   },
@@ -16,16 +17,32 @@
   },
   "keywords": [
     "claude",
+    "claude-desktop",
     "mcp",
+    "model-context-protocol",
     "ai",
+    "assistant",
     "filesystem",
+    "terminal",
+    "shell",
     "developer-tools",
-    "claude-desktop"
+    "cli",
+    "productivity"
   ],
+  "author": "Kushagar Goel",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/KushagarGoel/claude-web.git"
+  },
+  "bugs": {
+    "url": "https://github.com/KushagarGoel/claude-web/issues"
+  },
+  "homepage": "https://github.com/KushagarGoel/claude-web#readme",
   "scripts": {},
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",
+    "claude-web": "^1.0.0",
     "node-pty": "^1.1.0"
   },
   "devDependencies": {
