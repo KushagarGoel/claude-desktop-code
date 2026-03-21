@@ -11,13 +11,16 @@ import readline from "readline";
 const PROJECT_DIR  = process.cwd();
 const PROJECT_NAME = path.basename(PROJECT_DIR);
 
-// All claude-web data lives in ~/.claude-web/<project-slug>/
+// All claude-desktop-code data lives in ~/.claude-desktop-code/<project-slug>/
 // Slug = project name + short hash of absolute path (handles same-name projects)
 const PROJECT_SLUG   = `${PROJECT_NAME}-${createHash("sha1").update(PROJECT_DIR).digest("hex").slice(0, 6)}`;
-const GLOBAL_DIR     = path.join(os.homedir(), ".claude-web");
+const GLOBAL_DIR     = path.join(os.homedir(), ".claude-desktop-code");
 const SESSION_DIR    = path.join(GLOBAL_DIR, PROJECT_SLUG);
 const SHADOW_GIT_DIR = path.join(SESSION_DIR, "shadow.git");
 const ACTIVE_SYMLINK = path.join(GLOBAL_DIR, "active-project");
+
+// Legacy cleanup: remove old claude-web directory if exists
+const LEGACY_DIR = path.join(os.homedir(), ".claude-web");
 
 const PORT        = 11337;
 const DEBOUNCE_MS = 25_000; // commit after 25s of inactivity = end of a change burst
@@ -43,7 +46,7 @@ function detectProjectType(dir) {
 }
 
 // ── Terminal MCP script management ────────────────────────────────────────────
-// Create a mini npm package at ~/.claude-web/terminal-mcp/ with dependencies
+// Create a mini npm package at ~/.claude-desktop-code/terminal-mcp/ with dependencies
 
 const TERMINAL_MCP_DIR = path.join(GLOBAL_DIR, "terminal-mcp");
 const TERMINAL_MCP_SCRIPT = path.join(TERMINAL_MCP_DIR, "terminal-mcp.js");
@@ -76,7 +79,7 @@ async function updateTerminalMcpScript() {
       return { ok: false, reason: "Could not find terminal-mcp.js source" };
     }
 
-    // Read dependencies from claude-web package.json
+    // Read dependencies from claude-desktop-code package.json
     const claudeWebPkgPath = getClaudeWebPkgPath();
     const deps = {};
     if (claudeWebPkgPath) {
@@ -151,7 +154,7 @@ async function injectMcpServer(cfg) {
   };
 
   // Terminal MCP server (secure, project-scoped)
-  // Set up mini npm package at ~/.claude-web/terminal-mcp/ with dependencies
+  // Set up mini npm package at ~/.claude-desktop-code/terminal-mcp/ with dependencies
   const terminalMcpResult = await updateTerminalMcpScript();
   if (!terminalMcpResult.ok) {
     console.warn(`  ⚠  Failed to set up terminal-mcp: ${terminalMcpResult.reason}`);
@@ -178,7 +181,7 @@ function removeMcpServer(cfg) {
 }
 
 // ── Symlink management ────────────────────────────────────────────────────────
-// ~/.claude-web/active-project → current project directory
+// ~/.claude-desktop-code/active-project → current project directory
 
 function updateActiveSymlink() {
   fs.mkdirSync(GLOBAL_DIR, { recursive: true });
@@ -230,7 +233,7 @@ function removeActiveSymlink() {
 }
 
 // ── Shadow git ────────────────────────────────────────────────────────────────
-// Stored in ~/.claude-web/<project-slug>/shadow.git — never touches the project.
+// Stored in ~/.claude-desktop-code/<project-slug>/shadow.git — never touches the project.
 // Each project gets its own shadow git based on absolute path (via PROJECT_SLUG).
 
 function shadowGit(args) {
@@ -258,8 +261,8 @@ function initShadowGit() {
   const init = spawnSync("git", ["init", "--bare", SHADOW_GIT_DIR], { stdio: "pipe", encoding: "utf-8" });
   if (init.status !== 0) return { ok: false, reason: init.stderr?.trim() || "git init --bare failed" };
 
-  shadowGit(["config", "user.email", "claude-web@local"]);
-  shadowGit(["config", "user.name",  "claude-web"]);
+  shadowGit(["config", "user.email", "claude-desktop-code@local"]);
+  shadowGit(["config", "user.name",  "claude-desktop-code"]);
 
   // Exclude rules act as .gitignore for the shadow repo
   const excludePath = path.join(SHADOW_GIT_DIR, "info", "exclude");
@@ -439,11 +442,11 @@ function runStatus() {
     ? symlinkInfo.isCurrent ? "✓ This project (ACTIVE)" : `→ ${symlinkInfo.target}`
     : "✗ None";
 
-  console.log("\n  ✦ claude-web · status\n  " + "─".repeat(50));
+  console.log("\n  ✦ claude-desktop-code · status\n  " + "─".repeat(50));
   console.log(`  Project    : ${PROJECT_NAME}`);
   console.log(`  Path       : ${PROJECT_DIR}`);
-  console.log(`  Snapshots  : ~/.claude-web/${PROJECT_SLUG}/`);
-  console.log(`  Active link: ~/.claude-web/active-project`);
+  console.log(`  Snapshots  : ~/.claude-desktop-code/${PROJECT_SLUG}/`);
+  console.log(`  Active link: ~/.claude-desktop-code/active-project`);
   console.log(`  Points to  : ${activeDisplay}`);
 
   const shadowExists = fs.existsSync(SHADOW_GIT_DIR);
@@ -461,7 +464,7 @@ function runStatus() {
 // ── Clean ─────────────────────────────────────────────────────────────────────
 
 function runClean() {
-  console.log("\n  ✦ claude-web · clean\n  " + "─".repeat(50));
+  console.log("\n  ✦ claude-desktop-code · clean\n  " + "─".repeat(50));
 
   // Remove MCP server config from Claude Desktop
   const configPath = getClaudeConfigPath();
@@ -487,10 +490,10 @@ function runClean() {
     console.log(`  ⚠  Failed to remove symlink: ${symlinkResult.reason}`);
   }
 
-  // Remove this project's session folder from ~/.claude-web/
+  // Remove this project's session folder from ~/.claude-desktop-code/
   if (fs.existsSync(SESSION_DIR)) {
     fs.rmSync(SESSION_DIR, { recursive: true, force: true });
-    console.log(`  ✓ Removed ~/.claude-web/${PROJECT_SLUG}/`);
+    console.log(`  ✓ Removed ~/.claude-desktop-code/${PROJECT_SLUG}/`);
   } else {
     console.log(`  ℹ  No session data found for this project (${PROJECT_SLUG}).`);
   }
@@ -524,20 +527,20 @@ async function main() {
   await injectMcpServer(cfg);
   writeClaudeConfig(configPath, cfg);
 
-  console.log(`\n  ✦ claude-web\n  ${"─".repeat(50)}`);
+  console.log(`\n  ✦ claude-desktop-code\n  ${"─".repeat(50)}`);
   console.log(`  Project  : ${PROJECT_NAME}`);
   console.log(`  Path     : ${PROJECT_DIR}`);
   console.log(`  Type     : ${projectType}`);
-  console.log(`  Session  : ~/.claude-web/${PROJECT_SLUG}/`);
+  console.log(`  Session  : ~/.claude-desktop-code/${PROJECT_SLUG}/`);
   console.log(`  ${"─".repeat(50)}`);
 
   if (!symlinkResult.ok) {
     console.log(`  ⚠  Failed to update symlink: ${symlinkResult.reason}`);
   } else if (symlinkResult.changed) {
-    console.log(`  ✓ Active project updated: ~/.claude-web/active-project`);
+    console.log(`  ✓ Active project updated: ~/.claude-desktop-code/active-project`);
     console.log(`    → Now points to: ${PROJECT_DIR}`);
   } else {
-    console.log(`  ✓ Already active: ~/.claude-web/active-project → ${PROJECT_DIR}`);
+    console.log(`  ✓ Already active: ~/.claude-desktop-code/active-project → ${PROJECT_DIR}`);
   }
 
   console.log(`  ✓ MCP config injected: ${configPath}`);
@@ -546,7 +549,7 @@ async function main() {
   if (!shadow.ok) {
     console.log(`  ⚠  Shadow git skipped: ${shadow.reason}`);
   } else {
-    console.log(`  ✓ Shadow git ready   (~/.claude-web/${PROJECT_SLUG}/shadow.git) [fresh]`);
+    console.log(`  ✓ Shadow git ready   (~/.claude-desktop-code/${PROJECT_SLUG}/shadow.git) [fresh]`);
     console.log(`  ✓ Initial snapshot   ${shadow.hash}  ${shadow.startedAt}`);
   }
 

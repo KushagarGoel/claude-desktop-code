@@ -1,10 +1,10 @@
-# claude-web
+# claude-desktop-code
 
 Connect Claude Desktop to any project instantly — one command, full filesystem and terminal access via MCP.
 
 ## Features
 
-- **One-command setup** — Run `claude-web` in any project directory
+- **One-command setup** — Run `claude-desktop-code` in any project directory
 - **Filesystem access** — Claude can read and write files in your project
 - **Terminal access** — Execute commands, run scripts, search code
 - **Session snapshots** — Automatic git-based snapshots of your work
@@ -19,22 +19,22 @@ Connect Claude Desktop to any project instantly — one command, full filesystem
 ## Installation
 
 ```bash
-npm install -g claude-web
+npm install -g claude-desktop-code
 ```
 
 Or use npx (no install):
 
 ```bash
-npx claude-web
+npx claude-desktop-code
 ```
 
 ## Usage
 
-### Start claude-web
+### Start claude-desktop-code
 
 ```bash
 cd your-project
-claude-web
+claude-desktop-code
 ```
 
 This will:
@@ -47,13 +47,13 @@ This will:
 
 | Command | Description |
 |---------|-------------|
-| `claude-web` | Start claude-web for current project |
-| `claude-web status` | Show current project status and recent snapshots |
-| `claude-web clean` | Remove MCP config and session data |
+| `claude-desktop-code` | Start claude-desktop-code for current project |
+| `claude-desktop-code status` | Show current project status and recent snapshots |
+| `claude-desktop-code clean` | Remove MCP config and session data |
 
 ### Using with Claude Desktop
 
-After running `claude-web`:
+After running `claude-desktop-code`:
 
 1. Restart Claude Desktop when prompted
 2. Claude will have access to your project files
@@ -65,25 +65,25 @@ After running `claude-web`:
 
 ## How It Works
 
-claude-web sets up two MCP servers in Claude Desktop:
+claude-desktop-code sets up two MCP servers in Claude Desktop:
 
 1. **filesystem** — Provides read/write access to your project directory
 2. **terminal** — Secure shell command execution within your project
 
-Your project path is symlinked to `~/.claude-web/active-project`, so Claude always accesses the correct directory.
+Your project path is symlinked to `~/.claude-desktop-code/active-project`, so Claude always accesses the correct directory.
 
 ### Session Snapshots
 
-Changes are automatically committed to a shadow git repository at `~/.claude-web/<project>/shadow.git`. This lets you:
+Changes are automatically committed to a shadow git repository at `~/.claude-desktop-code/<project>/shadow.git`. This lets you:
 - Track history without polluting your project's git
-- Revert to previous states via the web dashboard
+- **Revert to previous states** via the web dashboard — click "↩ Revert" on any snapshot to restore your project to that point
 
 ## Configuration
 
-Session data is stored in `~/.claude-web/`:
+Session data is stored in `~/.claude-desktop-code/`:
 
 ```
-~/.claude-web/
+~/.claude-desktop-code/
 ├── active-project        → symlink to current project
 ├── terminal-mcp/         # MCP server with dependencies
 │   ├── terminal-mcp.js

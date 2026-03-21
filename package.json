@@ -1,11 +1,11 @@
 {
-  "name": "claude-web",
+  "name": "claude-desktop-code",
   "version": "1.0.0",
   "description": "Connect Claude Desktop to any project instantly — one command, filesystem + terminal access via MCP",
   "type": "module",
   "main": "./bin/cli.js",
   "bin": {
-    "claude-web": "./bin/cli.js"
+    "claude-desktop-code": "./bin/cli.js"
   },
   "files": [
     "bin/",
@@ -33,16 +33,15 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/KushagarGoel/claude-web.git"
+    "url": "git+https://github.com/KushagarGoel/claude-desktop-code.git"
   },
   "bugs": {
-    "url": "https://github.com/KushagarGoel/claude-web/issues"
+    "url": "https://github.com/KushagarGoel/claude-desktop-code/issues"
   },
-  "homepage": "https://github.com/KushagarGoel/claude-web#readme",
+  "homepage": "https://github.com/KushagarGoel/claude-desktop-code#readme",
   "scripts": {},
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",
-    "claude-web": "^1.0.0",
     "node-pty": "^1.1.0"
   },
   "devDependencies": {
