@@ -42,6 +42,85 @@ function detectProjectType(dir) {
   return "Unknown";
 }
 
+// ── Terminal MCP script management ────────────────────────────────────────────
+// Create a mini npm package at ~/.claude-web/terminal-mcp/ with dependencies
+
+const TERMINAL_MCP_DIR = path.join(GLOBAL_DIR, "terminal-mcp");
+const TERMINAL_MCP_SCRIPT = path.join(TERMINAL_MCP_DIR, "terminal-mcp.js");
+const TERMINAL_MCP_PKG = path.join(TERMINAL_MCP_DIR, "package.json");
+
+function getTerminalMcpSourcePath() {
+  try {
+    const cliDir = path.dirname(new URL(import.meta.url).pathname);
+    const srcPath = path.join(cliDir, "..", "src", "terminal-mcp.js");
+    if (fs.existsSync(srcPath)) return srcPath;
+  } catch {}
+  return null;
+}
+
+function getClaudeWebPkgPath() {
+  try {
+    const cliDir = path.dirname(new URL(import.meta.url).pathname);
+    const pkgPath = path.join(cliDir, "..", "package.json");
+    if (fs.existsSync(pkgPath)) return pkgPath;
+  } catch {}
+  return null;
+}
+
+async function updateTerminalMcpScript() {
+  try {
+    fs.mkdirSync(TERMINAL_MCP_DIR, { recursive: true });
+
+    const sourcePath = getTerminalMcpSourcePath();
+    if (!sourcePath) {
+      return { ok: false, reason: "Could not find terminal-mcp.js source" };
+    }
+
+    // Read dependencies from claude-web package.json
+    const claudeWebPkgPath = getClaudeWebPkgPath();
+    const deps = {};
+    if (claudeWebPkgPath) {
+      const pkg = JSON.parse(fs.readFileSync(claudeWebPkgPath, "utf-8"));
+      // Copy relevant dependencies (MCP SDK and any others needed)
+      if (pkg.dependencies) {
+        for (const [name, version] of Object.entries(pkg.dependencies)) {
+          deps[name] = version;
+        }
+      }
+    }
+
+    // Create package.json for the terminal-mcp mini-package
+    const pkgContent = {
+      name: "terminal-mcp",
+      version: "1.0.0",
+      type: "module",
+      dependencies: deps
+    };
+
+    // Write package.json
+    fs.writeFileSync(TERMINAL_MCP_PKG, JSON.stringify(pkgContent, null, 2), "utf-8");
+
+    // Copy the script
+    fs.copyFileSync(sourcePath, TERMINAL_MCP_SCRIPT);
+
+    // Run npm install
+    console.log("  → Installing terminal-mcp dependencies…");
+    const npmResult = spawnSync("npm", ["install"], {
+      cwd: TERMINAL_MCP_DIR,
+      stdio: "pipe",
+      encoding: "utf-8"
+    });
+
+    if (npmResult.status !== 0) {
+      return { ok: false, reason: `npm install failed: ${npmResult.stderr || npmResult.stdout}` };
+    }
+
+    return { ok: true, path: TERMINAL_MCP_SCRIPT };
+  } catch (err) {
+    return { ok: false, reason: err.message };
+  }
+}
+
 // ── Claude Desktop config ─────────────────────────────────────────────────────
 
 function getClaudeConfigPath() {
@@ -62,18 +141,38 @@ function writeClaudeConfig(p, cfg) {
   fs.writeFileSync(p, JSON.stringify(cfg, null, 2), "utf-8");
 }
 
-function injectMcpServer(cfg) {
+async function injectMcpServer(cfg) {
   if (!cfg.mcpServers) cfg.mcpServers = {};
+
+  // Filesystem MCP server
   cfg.mcpServers["filesystem"] = {
     command: "npx",
     args: ["-y", "@modelcontextprotocol/server-filesystem", ACTIVE_SYMLINK]
   };
+
+  // Terminal MCP server (secure, project-scoped)
+  // Set up mini npm package at ~/.claude-web/terminal-mcp/ with dependencies
+  const terminalMcpResult = await updateTerminalMcpScript();
+  if (!terminalMcpResult.ok) {
+    console.warn(`  ⚠  Failed to set up terminal-mcp: ${terminalMcpResult.reason}`);
+    console.warn(`     Terminal MCP server will not be available.`);
+  } else {
+    cfg.mcpServers["terminal"] = {
+      command: "node",
+      args: [TERMINAL_MCP_SCRIPT],
+      env: {
+        PROJECT_ROOT: PROJECT_DIR
+      }
+    };
+  }
+
   return cfg;
 }
 
 function removeMcpServer(cfg) {
-  if (cfg.mcpServers && cfg.mcpServers["filesystem"]) {
+  if (cfg.mcpServers) {
     delete cfg.mcpServers["filesystem"];
+    delete cfg.mcpServers["terminal"];
   }
   return cfg;
 }
@@ -367,7 +466,7 @@ function runClean() {
   // Remove MCP server config from Claude Desktop
   const configPath = getClaudeConfigPath();
   const cfg = readClaudeConfig(configPath);
-  const hadMcp = cfg.mcpServers && cfg.mcpServers["filesystem"];
+  const hadMcp = cfg.mcpServers && (cfg.mcpServers["filesystem"] || cfg.mcpServers["terminal"]);
   removeMcpServer(cfg);
   writeClaudeConfig(configPath, cfg);
   if (hadMcp) {
@@ -396,6 +495,12 @@ function runClean() {
     console.log(`  ℹ  No session data found for this project (${PROJECT_SLUG}).`);
   }
 
+  // Remove terminal-mcp directory
+  if (fs.existsSync(TERMINAL_MCP_DIR)) {
+    fs.rmSync(TERMINAL_MCP_DIR, { recursive: true, force: true });
+    console.log(`  ✓ Removed terminal-mcp/`);
+  }
+
   console.log("\n  → Restart Claude Desktop to apply config changes.\n  " + "─".repeat(50) + "\n");
 }
 
@@ -416,7 +521,7 @@ async function main() {
 
   // Inject MCP server config into Claude Desktop
   const cfg = readClaudeConfig(configPath);
-  injectMcpServer(cfg);
+  await injectMcpServer(cfg);
   writeClaudeConfig(configPath, cfg);
 
   console.log(`\n  ✦ claude-web\n  ${"─".repeat(50)}`);

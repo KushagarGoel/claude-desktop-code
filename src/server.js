@@ -6,6 +6,7 @@ function getSuggestedPrompt(projectName, projectType, projectDir) {
   return [
     `You are a senior ${projectType} engineer pairing with me on "${projectName}".`,
     `The full codebase is at ${projectDir} — you have complete read/write access via the filesystem MCP.`,
+    `You also have terminal access to run commands (grep, npm, python, etc.) within the project directory.`,
     ``,
     `Before we start, do a thorough orientation:`,
     `1. List the directory tree (skip node_modules, .git, dist, build)`,
@@ -270,7 +271,7 @@ function buildPage({ projectDir, projectName, projectSlug, projectType, fileCoun
     </div>
     <div class="step done">
       <div class="step-num">✓</div>
-      <div class="step-text">MCP servers injected<span>filesystem · restart</span></div>
+      <div class="step-text">MCP servers injected<span>filesystem · terminal · restart</span></div>
     </div>
     ${shadowOk ? `<div class="step done">
       <div class="step-num">✓</div>

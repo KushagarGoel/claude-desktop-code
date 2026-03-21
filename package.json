@@ -22,5 +22,13 @@
     "developer-tools",
     "claude-desktop"
   ],
-  "license": "MIT"
+  "license": "MIT",
+  "scripts": {},
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "node-pty": "^1.1.0"
+  },
+  "devDependencies": {
+    "esbuild": "^0.27.4"
+  }
 }
