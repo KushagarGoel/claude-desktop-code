@@ -4,8 +4,9 @@ import os from "os";
 import path from "path";
 import fs from "fs";
 import { createHash } from "crypto";
-import { spawnSync } from "child_process";
+import { spawnSync, spawn } from "child_process";
 import { startServer } from "../src/server.js";
+import readline from "readline";
 
 const PROJECT_DIR  = process.cwd();
 const PROJECT_NAME = path.basename(PROJECT_DIR);
@@ -237,6 +238,53 @@ function nowStamp() {
   return new Date().toISOString().replace("T", " ").slice(0, 19);
 }
 
+// ── Claude Desktop restart prompt ─────────────────────────────────────────────
+
+function askRestartClaude() {
+  return new Promise((resolve) => {
+    const rl = readline.createInterface({
+      input: process.stdin,
+      output: process.stdout
+    });
+    rl.question("  → Restart Claude Desktop now? [Y/n] ", (answer) => {
+      rl.close();
+      const ans = answer.trim().toLowerCase();
+      resolve(ans === "" || ans === "y" || ans === "yes");
+    });
+  });
+}
+
+function isClaudeRunning() {
+  const result = spawnSync("pgrep", ["-x", "Claude"], { stdio: "pipe" });
+  return result.status === 0;
+}
+
+async function restartClaudeDesktop() {
+  console.log("  → Killing Claude Desktop…");
+  spawnSync("killall", ["Claude"], { stdio: "pipe" });
+
+  console.log("  → Waiting for Claude to close…");
+  await new Promise(r => setTimeout(r, 10000));
+
+  // Check if Claude is still running, wait until it's fully closed
+  let waitCount = 0;
+  while (isClaudeRunning()) {
+    waitCount++;
+    process.stdout.write(`  → Still running, retrying kill… (${waitCount}s)\n`);
+    spawnSync("killall", ["-9", "Claude"], { stdio: "pipe" });
+    await new Promise(r => setTimeout(r, 1000));
+  }
+
+  console.log("  → Starting Claude Desktop…");
+  const child = spawn("open", ["-a", "Claude"], {
+    detached: true,
+    stdio: "ignore"
+  });
+  child.unref();
+
+  console.log("  ✓ Claude Desktop restarted\n");
+}
+
 // ── File watcher ──────────────────────────────────────────────────────────────
 // Deferred commit: stage files immediately, commit after debounce.
 // This collapses rapid bursts of changes into one snapshot.
@@ -408,7 +456,14 @@ async function main() {
   }
 
   console.log(`  ✓ Starting UI at http://localhost:${PORT}\n`);
-  console.log("  → Restart Claude Desktop to apply config changes.\n");
+
+  // Prompt to restart Claude Desktop
+  const shouldRestart = await askRestartClaude();
+  if (shouldRestart) {
+    await restartClaudeDesktop();
+  } else {
+    console.log("  ℹ  Skipped automatic restart. You must manually restart Claude Desktop to apply the new config.\n");
+  }
 
   await startServer({
     projectDir: PROJECT_DIR,
