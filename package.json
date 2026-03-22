@@ -1,6 +1,6 @@
 {
   "name": "claude-desktop-code",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Connect Claude Desktop to any project instantly — one command, filesystem + terminal access via MCP",
   "type": "module",
   "main": "./bin/cli.js",
@@ -30,7 +30,7 @@
     "productivity"
   ],
   "author": "Kushagar Goel",
-  "license": "MIT",
+  "license": "AGPL-3.0",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/KushagarGoel/claude-desktop-code.git"
