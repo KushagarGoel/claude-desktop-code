@@ -466,6 +466,15 @@ function runStatus() {
 function runClean() {
   console.log("\n  ✦ claude-desktop-code · clean\n  " + "─".repeat(50));
 
+  // Kill running terminal-mcp processes
+  console.log("  → Stopping terminal-mcp processes...");
+  try {
+    spawnSync("pkill", ["-f", "terminal-mcp.js"], { stdio: "pipe" });
+    console.log("  ✓ Stopped terminal-mcp processes");
+  } catch {
+    // Ignore errors if no processes found
+  }
+
   // Remove MCP server config from Claude Desktop
   const configPath = getClaudeConfigPath();
   const cfg = readClaudeConfig(configPath);
@@ -478,33 +487,18 @@ function runClean() {
     console.log(`  ℹ  No MCP config found in: ${configPath}`);
   }
 
-  // Remove active symlink if it points to this project
-  const symlinkResult = removeActiveSymlink();
-  if (symlinkResult.ok) {
-    if (symlinkResult.removed) {
-      console.log(`  ✓ Removed active-project symlink${symlinkResult.wasCurrent ? " (was this project)" : ""}`);
-    } else {
-      console.log("  ℹ  No active-project symlink found");
-    }
+  // Remove entire ~/.claude-desktop-code/ directory
+  if (fs.existsSync(GLOBAL_DIR)) {
+    fs.rmSync(GLOBAL_DIR, { recursive: true, force: true });
+    console.log(`  ✓ Removed ~/.claude-desktop-code/`);
   } else {
-    console.log(`  ⚠  Failed to remove symlink: ${symlinkResult.reason}`);
-  }
-
-  // Remove this project's session folder from ~/.claude-desktop-code/
-  if (fs.existsSync(SESSION_DIR)) {
-    fs.rmSync(SESSION_DIR, { recursive: true, force: true });
-    console.log(`  ✓ Removed ~/.claude-desktop-code/${PROJECT_SLUG}/`);
-  } else {
-    console.log(`  ℹ  No session data found for this project (${PROJECT_SLUG}).`);
-  }
-
-  // Remove terminal-mcp directory
-  if (fs.existsSync(TERMINAL_MCP_DIR)) {
-    fs.rmSync(TERMINAL_MCP_DIR, { recursive: true, force: true });
-    console.log(`  ✓ Removed terminal-mcp/`);
+    console.log(`  ℹ  No ~/.claude-desktop-code/ directory found`);
   }
 
   console.log("\n  → Restart Claude Desktop to apply config changes.\n  " + "─".repeat(50) + "\n");
+
+  // Exit cleanly
+  process.exit(0);
 }
 
 // ── Help ──────────────────────────────────────────────────────────────────────

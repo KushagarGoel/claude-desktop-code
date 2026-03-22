@@ -11,12 +11,419 @@ import path from "path";
 import fs from "fs";
 import os from "os";
 
-// ── Configuration ─────────────────────────────────────────────────────────────
-
 const PROJECT_ROOT = process.env.PROJECT_ROOT || process.cwd();
 const APPROVAL_CONFIG_PATH = path.join(os.homedir(), ".claude-web", "terminal-approval.json");
 
-// Commands that are generally safe for read-only operations
+// ── Shell Detection ───────────────────────────────────────────────────────────
+
+function detectShell() {
+  const shells = [
+    process.env.SHELL,
+    "/bin/bash",
+    "/usr/bin/bash",
+    "/bin/zsh",
+    "/usr/bin/zsh",
+    "/bin/sh",
+    "/usr/bin/sh",
+  ];
+
+  for (const shell of shells) {
+    if (shell && fs.existsSync(shell)) {
+      return shell;
+    }
+  }
+  return "sh";
+}
+
+const SHELL_PATH = detectShell();
+const SHELL_NAME = path.basename(SHELL_PATH);
+
+// ── Session State Management ─────────────────────────────────────────────────
+
+class SessionState {
+  constructor(cwd = PROJECT_ROOT) {
+    this.cwd = cwd;
+    this.env = { ...process.env, TERM: "xterm-256color" };
+    this.startTime = Date.now();
+    this.sessionId = `session_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+  }
+
+  updateCwdFromCommand(command) {
+    const cdMatch = command.match(/^\s*cd\s+["']?([^"';]+)["']?/);
+    if (cdMatch) {
+      const targetPath = cdMatch[1].trim();
+      if (targetPath === "-") return null;
+      const newPath = path.resolve(this.cwd, targetPath);
+      if (fs.existsSync(newPath) && fs.statSync(newPath).isDirectory()) {
+        this.cwd = newPath;
+        return newPath;
+      }
+    }
+    return null;
+  }
+
+  updateEnvFromCommand(command) {
+    const exportMatch = command.match(/^\s*export\s+(\w+)=['"]?([^'"]*)['"]?/);
+    if (exportMatch) {
+      const [, varName, value] = exportMatch;
+      this.env[varName] = value;
+      return { [varName]: value };
+    }
+    return null;
+  }
+
+  getInfo() {
+    return {
+      cwd: this.cwd,
+      uptime: Date.now() - this.startTime,
+      sessionId: this.sessionId,
+    };
+  }
+}
+
+// ── Terminal Log Buffer ───────────────────────────────────────────────────────
+
+const LOG_FILE_PATH = path.join(os.homedir(), ".claude-web", "terminal-logs.json");
+
+class TerminalLogBuffer {
+  constructor(maxEntries = 200) {
+    this.entries = [];
+    this.maxEntries = maxEntries;
+    this.loadFromFile();
+  }
+
+  loadFromFile() {
+    try {
+      if (fs.existsSync(LOG_FILE_PATH)) {
+        const data = fs.readFileSync(LOG_FILE_PATH, "utf-8");
+        this.entries = JSON.parse(data);
+      }
+    } catch {
+      this.entries = [];
+    }
+  }
+
+  saveToFile() {
+    try {
+      fs.mkdirSync(path.dirname(LOG_FILE_PATH), { recursive: true });
+      fs.writeFileSync(LOG_FILE_PATH, JSON.stringify(this.entries, null, 2));
+    } catch (err) {
+      console.error(`[terminal-mcp] Failed to save logs: ${err.message}`);
+    }
+  }
+
+  log(type, data) {
+    const entry = {
+      timestamp: new Date().toISOString(),
+      type,
+      ...data,
+    };
+    this.entries.push(entry);
+    if (this.entries.length > this.maxEntries) {
+      this.entries = this.entries.slice(-this.maxEntries);
+    }
+    this.saveToFile();
+  }
+
+  getEntries(options = {}) {
+    const { type, limit = 50, since } = options;
+    let entries = [...this.entries];
+    if (type) entries = entries.filter(e => e.type === type);
+    if (since) entries = entries.filter(e => new Date(e.timestamp) >= new Date(since));
+    return entries.slice(-limit);
+  }
+
+  clear() {
+    this.entries = [];
+    this.saveToFile();
+  }
+
+  format(entries) {
+    return entries.map(e => {
+      const time = new Date(e.timestamp).toLocaleTimeString();
+      switch (e.type) {
+        case 'session_start':
+          return `[${time}] [SESSION] Started (shell: ${e.shell}, session: ${e.sessionId})`;
+        case 'session_kill':
+          return `[${time}] [SESSION] Killed (${e.sessionId})`;
+        case 'command':
+          return `[${time}] [CMD] ${e.command}`;
+        case 'output':
+          const preview = e.stdout?.substring(0, 100)?.replace(/\n/g, '\\n') || '(no output)';
+          return `[${time}] [OUT] Exit: ${e.exitCode} | ${preview}${e.stdout?.length > 100 ? '...' : ''}`;
+        case 'error':
+          return `[${time}] [ERR] ${e.message}`;
+        case 'state_change':
+          return `[${time}] [STATE] ${e.change}: ${e.value}`;
+        default:
+          return `[${time}] [${e.type.toUpperCase()}] ${JSON.stringify(e)}`;
+      }
+    }).join('\n');
+  }
+}
+
+// Export function to get logs for web UI
+export function getTerminalLogs(options = {}) {
+  const { type, limit = 50, since, clear = false } = options;
+  const buffer = new TerminalLogBuffer();
+  const entries = buffer.getEntries({ type, limit, since });
+  if (clear) buffer.clear();
+  return { entries, formatted: buffer.format(entries), count: entries.length };
+}
+
+// Clear terminal logs on server restart
+export function clearTerminalLogs() {
+  try {
+    if (fs.existsSync(LOG_FILE_PATH)) {
+      fs.writeFileSync(LOG_FILE_PATH, "[]", "utf-8");
+    }
+  } catch (err) {
+    console.error(`[terminal-mcp] Failed to clear logs: ${err.message}`);
+  }
+}
+
+// ── Terminal Session (spawn-based only) ───────────────────────────────────────
+
+class TerminalSession {
+  constructor(cwd = PROJECT_ROOT) {
+    this.state = new SessionState(cwd);
+    this.logger = new TerminalLogBuffer(100);
+    this.isRunning = false;
+  }
+
+  start() {
+    this.isRunning = true;
+    this.logger.log('session_start', {
+      mode: 'spawn',
+      shell: SHELL_PATH,
+      cwd: this.state.cwd,
+      sessionId: this.state.sessionId
+    });
+    return Promise.resolve();
+  }
+
+  kill() {
+    this.logger.log('session_kill', {
+      sessionId: this.state.sessionId,
+      wasRunning: this.isRunning
+    });
+    this.isRunning = false;
+  }
+
+  async execute(command, timeoutMs = 30000) {
+    // Log the command
+    this.logger.log('command', {
+      command,
+      sessionId: this.state.sessionId,
+      cwd: this.state.cwd
+    });
+
+    // Track state changes from the command
+    const newCwd = this.state.updateCwdFromCommand(command);
+    if (newCwd) {
+      this.logger.log('state_change', { change: 'cwd', value: newCwd });
+    }
+    const newEnv = this.state.updateEnvFromCommand(command);
+    if (newEnv) {
+      this.logger.log('state_change', { change: 'env', value: JSON.stringify(newEnv) });
+    }
+
+    return this._executeSpawn(command, timeoutMs);
+  }
+
+  _executeSpawn(command, timeoutMs) {
+    return new Promise((resolve) => {
+      // Build state injection script
+      const stateScript = this._buildStateScript();
+
+      // Create a wrapper that:
+      // 1. Sources current state
+      // 2. Runs the command
+      // 3. Captures new state (cwd and env vars)
+      const wrappedCommand = `
+${stateScript}
+__run_command() {
+  ${command}
+  __EXIT_CODE=$?
+  echo ""
+  echo "__STATE_MARKER_START__"
+  echo "PWD: $(pwd)"
+  env | grep -E '^(MY_|USER_|APP_|NODE_|VITE_|REACT_|NEXT_)' 2>/dev/null || true
+  echo "__STATE_MARKER_END__"
+  exit $__EXIT_CODE
+}
+__run_command
+`;
+
+      const child = spawn("bash", ["-c", wrappedCommand], {
+        cwd: this.state.cwd,
+        env: { ...process.env, ...this.state.env },
+      });
+
+      let stdout = "";
+      let stderr = "";
+      let killed = false;
+
+      const timeout = setTimeout(() => {
+        killed = true;
+        child.kill("SIGTERM");
+        setTimeout(() => {
+          if (!child.killed) child.kill("SIGKILL");
+        }, 5000);
+      }, timeoutMs);
+
+      child.stdout.on("data", (data) => {
+        stdout += data.toString();
+        if (stdout.length > 100000) {
+          stdout = stdout.slice(0, 100000) + "\n... (output truncated)";
+        }
+      });
+
+      child.stderr.on("data", (data) => {
+        stderr += data.toString();
+        if (stderr.length > 100000) {
+          stderr = stderr.slice(0, 100000) + "\n... (stderr truncated)";
+        }
+      });
+
+      child.on("close", (code) => {
+        clearTimeout(timeout);
+
+        // Parse state markers from output
+        const stateResult = this._parseStateFromOutput(stdout);
+        if (stateResult.newCwd) {
+          this.state.cwd = stateResult.newCwd;
+        }
+        if (stateResult.newEnv) {
+          Object.assign(this.state.env, stateResult.newEnv);
+        }
+
+        // Remove state markers from output
+        const cleanStdout = this._cleanStateMarkers(stdout);
+
+        this.logger.log('output', {
+          command,
+          stdout: cleanStdout.substring(0, 1000),
+          stderr: stderr.trim().substring(0, 500),
+          exitCode: code,
+          timedOut: killed,
+          sessionId: this.state.sessionId,
+        });
+
+        resolve({
+          success: code === 0 && !killed,
+          stdout: cleanStdout,
+          stderr: stderr.trim(),
+          exitCode: code,
+          timedOut: killed,
+        });
+      });
+
+      child.on("error", (err) => {
+        clearTimeout(timeout);
+        resolve({
+          success: false,
+          stdout: "",
+          stderr: `Failed to execute: ${err.message}`,
+          exitCode: 1,
+        });
+      });
+    });
+  }
+
+  _buildStateScript() {
+    const exports = Object.entries(this.state.env)
+      .filter(([k]) => !k.match(/^(PATH|PWD|HOME|USER|TERM|SHELL)$/))
+      .map(([k, v]) => `export ${k}="${v.replace(/"/g, '\\"')}"`);
+
+    if (exports.length > 0) {
+      return exports.join("\n") + "\n";
+    }
+    return "# No custom env vars\n";
+  }
+
+  _parseStateFromOutput(output) {
+    const result = { newCwd: null, newEnv: {} };
+    const startMarker = "__STATE_MARKER_START__";
+    const endMarker = "__STATE_MARKER_END__";
+    const startIdx = output.indexOf(startMarker);
+    const endIdx = output.indexOf(endMarker);
+
+    if (startIdx === -1 || endIdx === -1 || endIdx <= startIdx) {
+      return result;
+    }
+
+    const stateSection = output.substring(startIdx + startMarker.length, endIdx).trim();
+    const lines = stateSection.split("\n");
+
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      if (trimmed.startsWith("PWD: ")) {
+        result.newCwd = trimmed.substring(5).trim();
+      } else if (trimmed.includes("=")) {
+        const eqIdx = trimmed.indexOf("=");
+        const key = trimmed.substring(0, eqIdx);
+        const value = trimmed.substring(eqIdx + 1);
+        if (key && !key.match(/^(PATH|PWD|HOME|USER|TERM|SHELL)$/)) {
+          result.newEnv[key] = value;
+        }
+      }
+    }
+
+    return result;
+  }
+
+  _cleanStateMarkers(output) {
+    const startMarker = "__STATE_MARKER_START__";
+    const endMarker = "__STATE_MARKER_END__";
+    let result = output;
+    const startIdx = result.indexOf(startMarker);
+    const endIdx = result.indexOf(endMarker);
+
+    if (startIdx !== -1 && endIdx !== -1 && endIdx > startIdx) {
+      result = result.substring(0, startIdx) + result.substring(endIdx + endMarker.length);
+    }
+
+    return result.replace(/\n\s*\n\s*\n/g, "\n\n").trim();
+  }
+
+  getInfo() {
+    const stateInfo = this.state.getInfo();
+    return {
+      cwd: stateInfo.cwd,
+      uptime: stateInfo.uptime,
+      isRunning: this.isRunning,
+      mode: "spawn",
+      sessionId: this.state.sessionId,
+    };
+  }
+}
+
+// Global session manager
+let activeSession = null;
+
+function getOrCreateSession() {
+  if (!activeSession) {
+    activeSession = new TerminalSession();
+  }
+  return activeSession;
+}
+
+function startNewSession() {
+  if (activeSession) {
+    activeSession.kill();
+  }
+  activeSession = new TerminalSession();
+  return activeSession;
+}
+
+function getSessionInfo() {
+  return activeSession?.getInfo() || { isRunning: false };
+}
+
+// ── Security & Commands ──────────────────────────────────────────────────────
+
 const READONLY_COMMANDS = new Set([
   "cat", "head", "tail", "less", "more",
   "ls", "ll", "la", "find", "tree",
@@ -35,7 +442,6 @@ const READONLY_COMMANDS = new Set([
   "kubectl", "kubectl get",
 ]);
 
-// Commands that can modify files/system - require explicit approval
 const MODIFICATION_COMMANDS = new Set([
   "rm", "rmdir", "mv", "cp", "scp",
   "chmod", "chown", "sudo",
@@ -48,14 +454,11 @@ const MODIFICATION_COMMANDS = new Set([
   "git checkout", "git reset", "git clean", "git stash", "git cherry-pick",
 ]);
 
-// Always blocked commands (too dangerous)
 const BLOCKED_COMMANDS = new Set([
   "sudo su", "sudo -i", "sudo bash",
   "> /dev", "mkfs", "dd", "fdisk",
   "wget", "curl", "> ~/.ssh", "> ~/.bashrc", "> ~/.zshrc",
 ]);
-
-// ── Approval State Management ─────────────────────────────────────────────────
 
 function loadApprovalConfig() {
   try {
@@ -92,11 +495,8 @@ function setAlwaysAllowed(commandKey, allowed) {
   saveApprovalConfig(config);
 }
 
-// ── Security Validation ───────────────────────────────────────────────────────
-
 function resolvePath(targetPath) {
   if (!targetPath) return PROJECT_ROOT;
-  // Handle tilde expansion
   if (targetPath.startsWith("~/")) {
     targetPath = path.join(os.homedir(), targetPath.slice(2));
   }
@@ -107,18 +507,15 @@ function isPathAllowed(targetPath) {
   const resolved = resolvePath(targetPath);
   const relative = path.relative(PROJECT_ROOT, resolved);
 
-  // Check for path traversal attempts
   if (relative.startsWith("..") || relative.includes("/../")) {
     return false;
   }
 
-  // Ensure the resolved path is within PROJECT_ROOT
   const realProjectRoot = fs.realpathSync(PROJECT_ROOT);
   let realResolved;
   try {
     realResolved = fs.realpathSync(resolved);
   } catch {
-    // Path doesn't exist yet - check parent directory
     const parent = path.dirname(resolved);
     try {
       const realParent = fs.realpathSync(parent);
@@ -132,7 +529,6 @@ function isPathAllowed(targetPath) {
 }
 
 function parseCommand(command) {
-  // Simple command parsing - handles quoted strings
   const args = [];
   let current = "";
   let inQuote = false;
@@ -162,7 +558,6 @@ function parseCommand(command) {
 function getCommandKey(args) {
   if (args.length === 0) return "";
   const base = args[0];
-  // Include subcommand for git, npm, etc.
   if (args.length > 1 && !args[1].startsWith("-")) {
     return `${base} ${args[1]}`;
   }
@@ -173,20 +568,18 @@ function checkCommandSafety(command) {
   const args = parseCommand(command);
   const cmdKey = getCommandKey(args);
 
-  // Check blocked commands
   for (const blocked of BLOCKED_COMMANDS) {
     if (command.includes(blocked)) {
       return { safe: false, reason: `Command contains blocked pattern: ${blocked}` };
     }
   }
 
-  // Check for shell injection patterns
   const dangerousPatterns = [
-    /`[^`]*`/,                    // Command substitution backticks
-    /\$\([^)]*\)/,                // Command substitution $(...)
-    />\s*\/dev\/null.*2>&1.*\|\s*(sh|bash|zsh)/i,  // Obfuscated shell
-    /;.*(sh|bash|zsh)\s+-c/i,     // Chained shell execution
-    /\|\s*(sh|bash|zsh)\s*$/i,   // Piped to shell
+    /`[^`]*`/,
+    /\$\([^)]*\)/,
+    />\s*\/dev\/null.*2>&1.*\|\s*(sh|bash|zsh)/i,
+    /;.*(sh|bash|zsh)\s+-c/i,
+    /\|\s*(sh|bash|zsh)\s*$/i,
   ];
   for (const pattern of dangerousPatterns) {
     if (pattern.test(command)) {
@@ -194,11 +587,9 @@ function checkCommandSafety(command) {
     }
   }
 
-  // Determine if modification-related
   const isModification = MODIFICATION_COMMANDS.has(cmdKey) ||
     MODIFICATION_COMMANDS.has(args[0]);
 
-  // Check if always allowed
   const alwaysAllowed = isAlwaysAllowed(cmdKey) || READONLY_COMMANDS.has(cmdKey);
 
   return {
@@ -209,8 +600,6 @@ function checkCommandSafety(command) {
     alwaysAllowed,
   };
 }
-
-// ── Command Execution ─────────────────────────────────────────────────────────
 
 function executeCommand(command, cwd, timeoutMs = 30000) {
   return new Promise((resolve) => {
@@ -226,7 +615,6 @@ function executeCommand(command, cwd, timeoutMs = 30000) {
       return;
     }
 
-    // Ensure directory exists
     if (!fs.existsSync(resolvedCwd)) {
       resolve({
         success: false,
@@ -256,7 +644,6 @@ function executeCommand(command, cwd, timeoutMs = 30000) {
 
     child.stdout.on("data", (data) => {
       stdout += data.toString();
-      // Limit output size to prevent memory issues
       if (stdout.length > 100000) {
         stdout = stdout.slice(0, 100000) + "\n... (output truncated)";
       }
@@ -310,8 +697,52 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
   return {
     tools: [
       {
+        name: "start_new_terminal",
+        description: `Start a fresh new terminal session. This will kill any existing terminal session and create a new one.
+
+Use this when:
+- You want to clear environment variables and state from previous commands
+- The current terminal session has become unstable or unresponsive
+- You need a clean slate for a new set of operations
+- Previous commands have left the terminal in an unexpected state
+
+Note: This is the ONLY way to start a new terminal. Commands automatically reuse the existing session.`,
+        inputSchema: {
+          type: "object",
+          properties: {
+            cwd: {
+              type: "string",
+              description: "Working directory to start the terminal in (relative to project root, default: project root)",
+              default: ".",
+            },
+          },
+        },
+      },
+      {
+        name: "get_terminal_status",
+        description: `Get information about the current terminal session.
+
+Returns:
+- Whether a terminal session is active
+- Current working directory
+- Session uptime
+- Session ID
+
+Use this to check if you need to start a new terminal session.`,
+        inputSchema: {
+          type: "object",
+          properties: {},
+        },
+      },
+      {
         name: "execute_command",
-        description: `Execute a shell command within the project directory. Commands are restricted to the project root for security.
+        description: `Execute a shell command in the persistent terminal session. Commands share the same session state (environment variables, current directory, etc.).
+
+SESSION BEHAVIOR:
+- All commands run in the SAME terminal session by default
+- Environment variables persist between commands
+- Directory changes (cd) affect subsequent commands
+- Only 'start_new_terminal' creates a fresh session
 
 SECURITY NOTES:
 - Commands only run within the project directory and its subdirectories
@@ -331,11 +762,6 @@ COMMON PATTERNS:
             command: {
               type: "string",
               description: "The shell command to execute",
-            },
-            cwd: {
-              type: "string",
-              description: "Working directory relative to project root (default: project root)",
-              default: ".",
             },
             timeout: {
               type: "number",
@@ -459,11 +885,9 @@ COMMON PATTERNS:
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
 
-  // ── execute_command ─────────────────────────────────────────────────────────
-  if (name === "execute_command") {
-    const { command, cwd = ".", timeout = 30000, always_allow = false } = args;
+  if (name === "start_new_terminal") {
+    const { cwd = "." } = args;
 
-    // Validate path
     if (!isPathAllowed(cwd)) {
       return {
         content: [{
@@ -474,7 +898,69 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       };
     }
 
-    // Check command safety
+    const resolvedCwd = resolvePath(cwd);
+    if (!fs.existsSync(resolvedCwd)) {
+      return {
+        content: [{
+          type: "text",
+          text: `Error: Working directory '${cwd}' does not exist`,
+        }],
+        isError: true,
+      };
+    }
+
+    const hadPrevious = !!activeSession;
+    startNewSession();
+    activeSession.state.cwd = resolvedCwd;
+    await activeSession.start();
+
+    const info = activeSession.getInfo();
+    return {
+      content: [{
+        type: "text",
+        text: `Terminal session ${hadPrevious ? "restarted" : "started"} successfully.
+
+Session Info:
+- Session ID: ${info.sessionId}
+- Shell: ${SHELL_PATH}
+- Working directory: ${cwd}
+- Session uptime: ${Math.round(info.uptime / 1000)}s`,
+      }],
+      isError: false,
+    };
+  }
+
+  if (name === "get_terminal_status") {
+    const info = getSessionInfo();
+
+    if (!info.isRunning) {
+      return {
+        content: [{
+          type: "text",
+          text: `No active terminal session.
+
+Use 'start_new_terminal' to create a new terminal session.`,
+        }],
+        isError: false,
+      };
+    }
+
+    return {
+      content: [{
+        type: "text",
+        text: `Terminal Session Status:
+- Active: ${info.isRunning ? "Yes" : "No"}
+- Session ID: ${info.sessionId || "N/A"}
+- Working directory: ${info.cwd || PROJECT_ROOT}
+- Session uptime: ${Math.round((info.uptime || 0) / 1000)}s`,
+      }],
+      isError: false,
+    };
+  }
+
+  if (name === "execute_command") {
+    const { command, timeout = 30000, always_allow = false } = args;
+
     const safety = checkCommandSafety(command);
     if (!safety.safe) {
       return {
@@ -486,34 +972,54 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       };
     }
 
-    // Handle approval requirement
     if (safety.requiresApproval) {
-      // This is where we'd normally prompt for approval
-      // For MCP, we return a special response that the client should handle
-      // The client (Claude Desktop) will show approval UI
       return {
         content: [{
           type: "text",
-          text: `APPROVAL_REQUIRED|{"command": "${command}", "cwd": "${cwd}", "reason": "This command may modify files or system state", "cmdKey": "${safety.cmdKey}"}`,
+          text: `APPROVAL_REQUIRED|{"command": "${command}", "reason": "This command may modify files or system state", "cmdKey": "${safety.cmdKey}"}`,
         }],
         isError: true,
       };
     }
 
-    // Execute the command
-    const result = await executeCommand(
-      command,
-      cwd,
-      Math.min(timeout, 120000)
-    );
+    let session;
+    try {
+      session = getOrCreateSession();
+      if (!session.isRunning) {
+        await session.start();
+      }
+    } catch (err) {
+      return {
+        content: [{
+          type: "text",
+          text: `Failed to start terminal session: ${err.message}`,
+        }],
+        isError: true,
+      };
+    }
 
-    // Save to always allow if requested
+    let result;
+    try {
+      result = await session.execute(
+        command,
+        Math.min(timeout, 120000)
+      );
+    } catch (err) {
+      return {
+        content: [{
+          type: "text",
+          text: `Command execution failed: ${err.message}`,
+        }],
+        isError: true,
+      };
+    }
+
     if (always_allow && safety.cmdKey) {
       setAlwaysAllowed(safety.cmdKey, true);
     }
 
     const output = [
-      result.timedOut ? "[Command timed out after 30s]" : "",
+      result.timedOut ? `[Command timed out after ${Math.round(timeout/1000)}s]` : "",
       result.stdout,
       result.stderr ? `--- stderr ---\n${result.stderr}` : "",
       result.exitCode !== 0 && !result.timedOut ? `[Exit code: ${result.exitCode}]` : "",
@@ -528,7 +1034,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     };
   }
 
-  // ── search_code ─────────────────────────────────────────────────────────────
   if (name === "search_code") {
     const { pattern, path: searchPath = ".", file_pattern, context = 2 } = args;
 
@@ -542,17 +1047,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       };
     }
 
-    // Prefer ripgrep, fall back to grep
     let command;
     try {
-      // Check if ripgrep is available
       await executeCommand("which rg", ".", 5000);
-      // Build ripgrep command
       const contextFlag = context > 0 ? `-C ${context}` : "";
       const typeFlag = file_pattern ? `-g "${file_pattern}"` : "";
       command = `rg ${contextFlag} ${typeFlag} "${pattern.replace(/"/g, '\\"')}" ${searchPath}`;
     } catch {
-      // Fall back to grep
       const includeFlag = file_pattern ? `--include="${file_pattern}"` : "";
       const contextFlag = context > 0 ? `-C ${context}` : "";
       command = `grep -r ${contextFlag} ${includeFlag} "${pattern.replace(/"/g, '\\"')}" ${searchPath}`;
@@ -565,11 +1066,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         type: "text",
         text: result.stdout || result.stderr || "(no matches found)",
       }],
-      isError: !result.success && result.exitCode !== 1, // Exit code 1 means no matches, not an error
+      isError: !result.success && result.exitCode !== 1,
     };
   }
 
-  // ── run_script ──────────────────────────────────────────────────────────────
   if (name === "run_script") {
     const { file, args: scriptArgs = [], interpreter } = args;
 
@@ -594,7 +1094,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       };
     }
 
-    // Determine interpreter
     let cmd;
     if (interpreter) {
       cmd = `${interpreter} "${file}" ${scriptArgs.map(a => `"${a.replace(/"/g, '\\"')}"`).join(" ")}`;
@@ -636,7 +1135,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     };
   }
 
-  // ── list_directory ──────────────────────────────────────────────────────────
   if (name === "list_directory") {
     const { path: listPath = ".", recursive = false, show_hidden = false } = args;
 
@@ -679,7 +1177,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     };
   }
 
-  // ── view_file ───────────────────────────────────────────────────────────────
   if (name === "view_file") {
     const { path: filePath, offset = 1, limit = 100 } = args;
 
@@ -715,7 +1212,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       };
     }
 
-    // Read file with offset and limit
     const maxLimit = Math.min(limit, 500);
     const command = `sed -n '${offset},$((offset + maxLimit - 1))p' "${filePath}" | head -n ${maxLimit}`;
     const result = await executeCommand(command, ".", 10000);

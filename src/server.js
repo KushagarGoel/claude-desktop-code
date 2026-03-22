@@ -1,4 +1,8 @@
 import http from "http";
+import { getTerminalLogs, clearTerminalLogs } from "./terminal-mcp.js";
+
+// Clear terminal logs on server restart
+clearTerminalLogs();
 
 // ── Suggested prompt ──────────────────────────────────────────────────────────
 
@@ -206,6 +210,72 @@ function buildPage({ projectDir, projectName, projectSlug, projectType, fileCoun
 
     .footer { text-align: center; font-size: 12px; color: var(--muted); font-family: var(--mono); padding-top: 8px; }
 
+    /* ── Terminal Logs ── */
+    .terminal-logs-container {
+      max-height: 400px;
+      overflow-y: auto;
+      background: #0a0a0c;
+      font-family: var(--mono);
+      font-size: 12px;
+    }
+    .terminal-logs-container::-webkit-scrollbar { width: 6px; }
+    .terminal-logs-container::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+    .terminal-logs {
+      padding: 12px 16px;
+    }
+    .log-entry {
+      display: flex;
+      gap: 12px;
+      padding: 6px 0;
+      border-bottom: 1px solid #1a1a1f;
+      line-height: 1.5;
+    }
+    .log-entry:last-child { border-bottom: none; }
+    .log-time {
+      color: #555;
+      flex-shrink: 0;
+      width: 60px;
+    }
+    .log-type {
+      flex-shrink: 0;
+      width: 60px;
+      text-transform: uppercase;
+      font-size: 10px;
+      padding: 2px 6px;
+      border-radius: 3px;
+      text-align: center;
+    }
+    .log-type.session { background: #7c6af720; color: #7c6af7; }
+    .log-type.mode { background: #f4b94220; color: #f4b942; }
+    .log-type.cmd { background: #3ddc8420; color: #3ddc84; }
+    .log-type.out { background: #2a2a32; color: #888; }
+    .log-type.err { background: #ff5f5720; color: #ff5f57; }
+    .log-type.state { background: #4ecdc420; color: #4ecdc4; }
+    .log-data {
+      flex: 1;
+      color: #b0b0c0;
+      word-break: break-word;
+      white-space: pre-wrap;
+    }
+    .log-data .mode-pty { color: #3ddc84; font-weight: 500; }
+    .log-data .mode-fallback { color: #f4b942; font-weight: 500; }
+    .clear-logs-btn {
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      color: var(--muted);
+      font-family: var(--mono);
+      font-size: 11px;
+      padding: 4px 10px;
+      border-radius: 6px;
+      cursor: pointer;
+      transition: all .15s;
+    }
+    .clear-logs-btn:hover {
+      background: var(--red-dim);
+      border-color: var(--red);
+      color: var(--red);
+    }
+
     .wrap > * { animation: fadein .4s ease both; }
     .wrap > *:nth-child(1){animation-delay:.00s} .wrap > *:nth-child(2){animation-delay:.08s}
     .wrap > *:nth-child(3){animation-delay:.16s} .wrap > *:nth-child(4){animation-delay:.24s}
@@ -237,6 +307,24 @@ function buildPage({ projectDir, projectName, projectSlug, projectType, fileCoun
         <div class="meta-item"><label>Config written</label><div class="value green">✓ done</div></div>
         <div class="meta-item full"><label>Project path</label><div class="value muted">${projectDir}</div></div>
         <div class="meta-item full"><label>Session data</label><div class="value muted">~/.claude-web/${projectSlug}/</div></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Terminal Logs -->
+  <div class="card">
+    <div class="card-header">
+      Terminal Logs
+      <div style="display:flex;gap:8px;align-items:center;">
+        <span class="badge badge-green" id="terminal-mode-badge">Loading…</span>
+        <button class="clear-logs-btn" id="clear-logs-btn" title="Clear logs">Clear</button>
+      </div>
+    </div>
+    <div class="card-body" style="padding:0;">
+      <div class="terminal-logs-container">
+        <div id="terminal-logs-list" class="terminal-logs">
+          <div class="snap-loading">Loading terminal logs…</div>
+        </div>
       </div>
     </div>
   </div>
@@ -425,6 +513,119 @@ if (SHADOW_OK) {
   fetchSnapshots();
   setInterval(fetchSnapshots, 5000);
 }
+
+// ── Terminal Logs ───────────────────────────────────────────────────────────
+let lastLogCount = 0;
+
+function getTypeClass(type) {
+  switch (type) {
+    case 'session_start':
+    case 'session_kill': return 'session';
+    case 'mode_switch': return 'mode';
+    case 'command': return 'cmd';
+    case 'output': return 'out';
+    case 'error': return 'err';
+    case 'state_change': return 'state';
+    default: return 'out';
+  }
+}
+
+function getTypeLabel(type) {
+  switch (type) {
+    case 'session_start': return 'SESSION';
+    case 'session_kill': return 'KILL';
+    case 'mode_switch': return 'MODE';
+    case 'command': return 'CMD';
+    case 'output': return 'OUT';
+    case 'error': return 'ERR';
+    case 'state_change': return 'STATE';
+    default: return type.toUpperCase();
+  }
+}
+
+function formatLogData(entry) {
+  switch (entry.type) {
+    case 'session_start':
+      return 'Started (mode: <span class="mode-' + entry.mode + '">' + entry.mode + '</span>, shell: ' + entry.shell + ')';
+    case 'mode_switch':
+      return 'Switched to <span class="mode-' + entry.mode + '">' + entry.mode + '</span> (' + entry.reason + ')';
+    case 'command':
+      return '<span class="mode-' + entry.mode + '">[' + entry.mode + ']</span> ' + entry.command;
+    case 'output':
+      const preview = entry.stdout?.substring(0, 80)?.replace(/\\n/g, '\\\\n') || '(no output)';
+      return 'Exit: ' + entry.exitCode + ' | ' + preview + (entry.stdout?.length > 80 ? '...' : '');
+    case 'error':
+      return entry.message;
+    case 'state_change':
+      return entry.change + ': ' + entry.value;
+    default:
+      return JSON.stringify(entry);
+  }
+}
+
+function renderTerminalLogs(logs) {
+  const container = document.getElementById("terminal-logs-list");
+  const badge = document.getElementById("terminal-mode-badge");
+
+  if (!logs.entries || logs.entries.length === 0) {
+    container.innerHTML = '<div class="snap-empty">No terminal logs yet — execute commands to see logs here.</div>';
+    return;
+  }
+
+  // Find current mode from most recent session_start or mode_switch
+  let currentMode = 'unknown';
+  for (let i = logs.entries.length - 1; i >= 0; i--) {
+    const e = logs.entries[i];
+    if (e.type === 'session_start') {
+      currentMode = e.mode;
+      break;
+    }
+    if (e.type === 'mode_switch') {
+      currentMode = e.mode;
+      break;
+    }
+  }
+
+  if (badge) {
+    badge.textContent = currentMode === 'pty' ? '● PTY mode' : (currentMode === 'fallback' ? '● Fallback mode' : '● No session');
+    badge.className = 'badge ' + (currentMode === 'pty' ? 'badge-green' : (currentMode === 'fallback' ? 'badge-amber' : 'badge-amber'));
+  }
+
+  container.innerHTML = logs.entries.map(function(e) {
+    const time = new Date(e.timestamp).toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    return '<div class="log-entry">' +
+      '<div class="log-time">' + time + '</div>' +
+      '<div class="log-type ' + getTypeClass(e.type) + '">' + getTypeLabel(e.type) + '</div>' +
+      '<div class="log-data">' + formatLogData(e) + '</div>' +
+    '</div>';
+  }).join('');
+
+  // Auto-scroll to bottom
+  container.scrollTop = container.scrollHeight;
+}
+
+async function fetchTerminalLogs() {
+  try {
+    const logs = await fetch("/api/terminal-logs").then(r => r.json());
+    if (logs.count !== lastLogCount) {
+      lastLogCount = logs.count;
+      renderTerminalLogs(logs);
+    }
+  } catch {}
+}
+
+document.getElementById("clear-logs-btn")?.addEventListener("click", async () => {
+  if (!confirm("Clear all terminal logs?")) return;
+  try {
+    await fetch("/api/terminal-logs/clear", { method: "POST" });
+    lastLogCount = 0;
+    document.getElementById("terminal-logs-list").innerHTML = '<div class="snap-empty">Logs cleared.</div>';
+    document.getElementById("terminal-mode-badge").textContent = 'Loading…';
+  } catch {}
+});
+
+fetchTerminalLogs();
+setInterval(fetchTerminalLogs, 2000);
 </script>
 </body>
 </html>`;
@@ -469,6 +670,20 @@ export async function startServer(opts) {
           res.end(JSON.stringify({ ok: false, error: "bad request" }));
         }
       });
+      return;
+    }
+
+    if (req.method === "GET" && req.url === "/api/terminal-logs") {
+      const logs = getTerminalLogs({ limit: 100 });
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(logs));
+      return;
+    }
+
+    if (req.method === "POST" && req.url === "/api/terminal-logs/clear") {
+      const logs = getTerminalLogs({ clear: true });
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: true, cleared: true }));
       return;
     }
 
