@@ -507,13 +507,79 @@ function runClean() {
   console.log("\n  → Restart Claude Desktop to apply config changes.\n  " + "─".repeat(50) + "\n");
 }
 
+// ── Help ──────────────────────────────────────────────────────────────────────
+
+function displayHelp() {
+  console.log(`
+  ✦ claude-desktop-code · CLI Help
+  ${"─".repeat(50)}
+
+  Usage: claude-desktop-code [command] [options]
+
+  Commands:
+    (none)         Start claude-desktop-code with full MCP setup
+    status         Show project status and recent snapshots
+    clean          Remove MCP config and session data
+    help           Show this help message
+
+  Options:
+    -h, --help     Show this help message
+    --version      Show version number
+
+  Examples:
+    claude-desktop-code           Start the server
+    claude-desktop-code status    Check project status
+    claude-desktop-code clean     Clean up configuration
+
+  ${"─".repeat(50)}
+`);
+}
+
+function displayVersion() {
+  const pkgPath = path.join(path.dirname(new URL(import.meta.url).pathname), "..", "package.json");
+  try {
+    const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf-8"));
+    console.log(`claude-desktop-code v${pkg.version}`);
+  } catch {
+    console.log("claude-desktop-code (version unknown)");
+  }
+}
+
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 async function main() {
-  const [,, command] = process.argv;
+  const [,, command, ...args] = process.argv;
 
+  // Handle help flags
+  if (command === "help" || command === "--help" || command === "-h" || (!command && args.includes("--help"))) {
+    displayHelp();
+    return;
+  }
+
+  // Handle version flag
+  if (command === "--version" || command === "-v") {
+    displayVersion();
+    return;
+  }
+
+  // Handle known commands
   if (command === "clean") { runClean(); return; }
   if (command === "status") { runStatus(); return; }
+
+  // Handle unknown commands
+  if (command && command.startsWith("-")) {
+    console.error(`\n  ✦ claude-desktop-code · Error\n  ${"─".repeat(50)}`);
+    console.error(`  Unknown option: ${command}`);
+    console.error(`  Run 'claude-desktop-code --help' for usage information.\n`);
+    process.exit(1);
+  }
+
+  if (command) {
+    console.error(`\n  ✦ claude-desktop-code · Error\n  ${"─".repeat(50)}`);
+    console.error(`  Unknown command: ${command}`);
+    console.error(`  Run 'claude-desktop-code --help' for usage information.\n`);
+    process.exit(1);
+  }
 
   const fileCount   = countFiles(PROJECT_DIR);
   const projectType = detectProjectType(PROJECT_DIR);
