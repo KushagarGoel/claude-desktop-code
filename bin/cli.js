@@ -8,6 +8,26 @@ import { spawnSync, spawn } from "child_process";
 import { startServer } from "../src/server.js";
 import readline from "readline";
 
+// ── ANSI Colors ───────────────────────────────────────────────────────────────
+
+const c = {
+  reset: '\x1b[0m',
+  bold: '\x1b[1m',
+  dim: '\x1b[2m',
+  red: '\x1b[31m',
+  green: '\x1b[32m',
+  yellow: '\x1b[33m',
+  blue: '\x1b[34m',
+  magenta: '\x1b[35m',
+  cyan: '\x1b[36m',
+  white: '\x1b[37m',
+  gray: '\x1b[90m',
+};
+
+function color(colorCode, text) {
+  return `${colorCode}${text}${c.reset}`;
+}
+
 const PROJECT_DIR  = process.cwd();
 const PROJECT_NAME = path.basename(PROJECT_DIR);
 
@@ -638,43 +658,43 @@ async function main() {
   await injectMcpServer(cfg);
   writeClaudeConfig(configPath, cfg);
 
-  console.log(`\n  ✦ claude-desktop-code\n  ${"─".repeat(50)}`);
-  console.log(`  Project  : ${PROJECT_NAME}`);
-  console.log(`  Path     : ${PROJECT_DIR}`);
-  console.log(`  Type     : ${projectType}`);
-  console.log(`  Session  : ~/.claude-desktop-code/${PROJECT_SLUG}/`);
-  console.log(`  ${"─".repeat(50)}`);
+  console.log(`\n  ${color(c.magenta, '✦')} ${color(c.bold, 'claude-desktop-code')}\n  ${color(c.gray, '─'.repeat(50))}`);
+  console.log(`  ${color(c.gray, 'Project:')} ${color(c.cyan, PROJECT_NAME)}`);
+  console.log(`  ${color(c.gray, 'Path:')}   ${color(c.dim, PROJECT_DIR)}`);
+  console.log(`  ${color(c.gray, 'Type:')}   ${color(c.yellow, projectType)}`);
+  console.log(`  ${color(c.gray, 'Session:')} ${color(c.dim, `~/.claude-desktop-code/${PROJECT_SLUG}/`)}`);
+  console.log(`  ${color(c.gray, '─'.repeat(50))}`);
 
   if (!symlinkResult.ok) {
-    console.log(`  ⚠  Failed to update symlink: ${symlinkResult.reason}`);
+    console.log(`  ${color(c.yellow, '⚠')}  Failed to update symlink: ${symlinkResult.reason}`);
   } else if (symlinkResult.changed) {
-    console.log(`  ✓ Active project updated: ~/.claude-desktop-code/active-project`);
-    console.log(`    → Now points to: ${PROJECT_DIR}`);
+    console.log(`  ${color(c.green, '✓')} Active project ${color(c.dim, 'updated')}: ${color(c.blue, '~/.claude-desktop-code/active-project')}`);
+    console.log(`    ${color(c.gray, '→')} Now points to: ${color(c.dim, PROJECT_DIR)}`);
   } else {
-    console.log(`  ✓ Already active: ~/.claude-desktop-code/active-project → ${PROJECT_DIR}`);
+    console.log(`  ${color(c.green, '✓')} Already active: ${color(c.blue, '~/.claude-desktop-code/active-project')} ${color(c.gray, '→')} ${color(c.dim, PROJECT_DIR)}`);
   }
 
-  console.log(`  ✓ MCP config injected: ${configPath}`);
+  console.log(`  ${color(c.green, '✓')} MCP config ${color(c.dim, 'injected')}: ${color(c.dim, configPath)}`);
 
   const shadow = initShadowGit();
   if (!shadow.ok) {
-    console.log(`  ⚠  Shadow git skipped: ${shadow.reason}`);
+    console.log(`  ${color(c.yellow, '⚠')}  Shadow git ${color(c.dim, 'skipped')}: ${shadow.reason}`);
   } else {
-    console.log(`  ✓ Shadow git ready   (~/.claude-desktop-code/${PROJECT_SLUG}/shadow.git) [fresh]`);
-    console.log(`  ✓ Initial snapshot   ${shadow.hash}  ${shadow.startedAt}`);
+    console.log(`  ${color(c.green, '✓')} Shadow git ${color(c.dim, 'ready')}   (${color(c.blue, `~/.claude-desktop-code/${PROJECT_SLUG}/shadow.git`)}) ${color(c.green, '[fresh]')}`);
+    console.log(`  ${color(c.green, '✓')} Initial ${color(c.dim, 'snapshot')}   ${color(c.cyan, shadow.hash)}  ${color(c.dim, shadow.startedAt)}`);
   }
 
   const watcher = shadow.ok
-    ? startFileWatcher(({ hash, ts }) => console.log(`  📸 snapshot ${hash}  ${ts}`))
+    ? startFileWatcher(({ hash, ts }) => console.log(`  ${color(c.magenta, '📸')} ${color(c.dim, 'snapshot')} ${color(c.cyan, hash)}  ${color(c.dim, ts)}`))
     : { ok: false };
 
   if (shadow.ok) {
     console.log(watcher.ok
-      ? `  ✓ File watcher active — commits after 15s of inactivity`
-      : `  ⚠  File watcher unavailable: ${watcher.reason}`);
+      ? `  ${color(c.green, '✓')} File watcher ${color(c.dim, 'active')} — commits after 15s of inactivity`
+      : `  ${color(c.yellow, '⚠')}  File watcher ${color(c.dim, 'unavailable')}: ${watcher.reason}`);
   }
 
-  console.log(`  ✓ Starting UI at http://localhost:${PORT}\n`);
+  console.log(`  ${color(c.green, '✓')} Starting UI at ${color(c.blue, `http://localhost:${PORT}`)}\n`);
 
   // Prompt to restart Claude Desktop
   const shouldRestart = await askRestartClaude();

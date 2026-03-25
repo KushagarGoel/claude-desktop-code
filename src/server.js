@@ -3,9 +3,15 @@ import fs from "fs";
 import path from "path";
 import os from "os";
 import { spawn, execSync } from "child_process";
-import { getTerminalLogs, clearTerminalLogs } from "./terminal-mcp.js";
 
-// Clear terminal logs on server restart
+// Stub terminal logs functions (legacy - now using ttyd-tmux)
+function getTerminalLogs(opts = {}) {
+  if (opts.clear) return { entries: [], count: 0 };
+  return { entries: [], count: 0 };
+}
+function clearTerminalLogs() {}
+
+// Clear terminal logs on server restart (legacy)
 clearTerminalLogs();
 
 // ── Terminal Session Management ────────────────────────────────────────────────
