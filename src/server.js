@@ -1,8 +1,339 @@
 import http from "http";
+import fs from "fs";
+import path from "path";
+import os from "os";
+import { spawn, execSync } from "child_process";
 import { getTerminalLogs, clearTerminalLogs } from "./terminal-mcp.js";
 
 // Clear terminal logs on server restart
 clearTerminalLogs();
+
+// ── Terminal Session Management ────────────────────────────────────────────────
+
+const SESSIONS_FILE = path.join(os.homedir(), ".claude-desktop-code", "terminal-sessions.json");
+const SESSION_PREFIX = "claude-term-";
+const TTYD_PORT_MIN = 10000;
+const TTYD_PORT_MAX = 10100;
+
+// Load sessions from disk
+function loadSessions() {
+  try {
+    if (fs.existsSync(SESSIONS_FILE)) {
+      return JSON.parse(fs.readFileSync(SESSIONS_FILE, "utf-8"));
+    }
+  } catch {}
+  return {};
+}
+
+// Save sessions to disk
+function saveSessions(sessions) {
+  try {
+    const dir = path.dirname(SESSIONS_FILE);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(SESSIONS_FILE, JSON.stringify(sessions, null, 2));
+  } catch {}
+}
+
+// Check if tmux is available
+function isTmuxAvailable() {
+  try {
+    execSync("which tmux", { stdio: "pipe" });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Check if ttyd is available
+function isTtydAvailable() {
+  try {
+    execSync("which ttyd", { stdio: "pipe" });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Check if tmux session exists
+function tmuxSessionExists(tmuxName) {
+  try {
+    execSync(`tmux has-session -t ${tmuxName}`, { stdio: "pipe" });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Get list of active terminal sessions with their status
+function getTerminalSessions() {
+  const sessions = loadSessions();
+  const result = [];
+
+  for (const [sessionId, data] of Object.entries(sessions)) {
+    const tmuxName = `${SESSION_PREFIX}${sessionId}`;
+    const isAlive = tmuxSessionExists(tmuxName);
+
+    result.push({
+      sessionId,
+      displayName: data.displayName || `Terminal ${result.length + 1}`,
+      url: `http://localhost:${data.port}`,
+      port: data.port,
+      createdAt: data.createdAt,
+      cwd: data.cwd,
+      isAlive,
+    });
+  }
+
+  return result;
+}
+
+// Get ports already in use by existing sessions
+function getUsedPorts() {
+  const sessions = loadSessions();
+  return new Set(Object.values(sessions).map(s => s.port));
+}
+
+// Detect OS platform
+function getOS() {
+  const platform = process.platform;
+  if (platform === 'darwin') return 'macos';
+  if (platform === 'linux') return 'linux';
+  if (platform === 'win32') return 'windows';
+  return 'unknown';
+}
+
+// Get install instructions based on OS
+function getInstallInstructions(os) {
+  const instructions = {
+    macos: {
+      tmux: 'brew install tmux',
+      ttyd: 'brew install ttyd'
+    },
+    linux: {
+      tmux: 'sudo apt-get install tmux  (Debian/Ubuntu)\nsudo yum install tmux      (CentOS/RHEL)\nsudo pacman -S tmux        (Arch)',
+      ttyd: 'sudo apt-get install ttyd  (Debian/Ubuntu)\nsudo yum install ttyd      (CentOS/RHEL)\nsudo pacman -S ttyd        (Arch)\n\nOr build from source:\ngit clone https://github.com/tsl0922/ttyd.git\ncd ttyd && mkdir build && cd build\ncmake .. && make && sudo make install'
+    },
+    windows: {
+      tmux: 'tmux is not natively supported on Windows.\nOptions:\n1. Use WSL (Windows Subsystem for Linux)\n2. Use Git Bash\n3. Use a Linux VM',
+      ttyd: 'ttyd is not natively supported on Windows.\nOptions:\n1. Use WSL (Windows Subsystem for Linux)\n2. Build from source with Cygwin/MSYS2\n3. Use a Linux VM'
+    }
+  };
+  return instructions[os] || instructions.linux;
+}
+
+// Check prerequisites and print instructions
+function checkPrerequisites() {
+  const tmuxOk = isTmuxAvailable();
+  const ttydOk = isTtydAvailable();
+
+  if (tmuxOk && ttydOk) {
+    console.log('  ✓ tmux and ttyd are installed');
+    return true;
+  }
+
+  const os = getOS();
+  const instructions = getInstallInstructions(os);
+
+  console.log('\n  ⚠  MISSING PREREQUISITES\n');
+  console.log('  ' + '─'.repeat(60));
+
+  if (!tmuxOk) {
+    console.log('\n  ❌ tmux is not installed\n');
+    console.log('  Install with:\n');
+    instructions.tmux.split('\n').forEach(line => {
+      console.log('    ' + line);
+    });
+  }
+
+  if (!ttydOk) {
+    console.log('\n  ❌ ttyd is not installed\n');
+    console.log('  Install with:\n');
+    instructions.ttyd.split('\n').forEach(line => {
+      console.log('    ' + line);
+    });
+  }
+
+  console.log('\n  ' + '─'.repeat(60));
+  console.log('\n  Terminal features will be unavailable until you install these.\n');
+
+  return false;
+}
+
+// Clean up orphaned tmux/ttyd sessions on startup
+function cleanupOrphanedSessions() {
+  try {
+    // Get list of tmux sessions
+    const result = execSync("tmux ls -F '#{session_name}' 2>/dev/null || echo ''", {
+      encoding: "utf-8",
+      stdio: ["pipe", "pipe", "pipe"]
+    });
+
+    const existingSessions = result.trim().split("\n").filter(Boolean);
+    const ourSessions = existingSessions.filter(name => name.startsWith(SESSION_PREFIX));
+
+    // Get sessions we know about
+    const knownSessions = loadSessions();
+    const knownTmuxNames = new Set(
+      Object.keys(knownSessions).map(id => `${SESSION_PREFIX}${id}`)
+    );
+
+    // Kill orphaned sessions (tmux sessions we didn't create)
+    let killedCount = 0;
+    for (const tmuxName of ourSessions) {
+      if (!knownTmuxNames.has(tmuxName)) {
+        try {
+          execSync(`tmux kill-session -t ${tmuxName}`, { stdio: "pipe" });
+          killedCount++;
+          console.log(`  ✓ Killed orphaned tmux session: ${tmuxName}`);
+        } catch {}
+      }
+    }
+
+    // Kill any orphaned ttyd processes
+    try {
+      execSync("pkill -f 'ttyd.*claude-term-'", { stdio: "pipe" });
+    } catch {}
+
+    // Clean up sessions file - remove entries for dead tmux sessions
+    let cleanedCount = 0;
+    for (const sessionId of Object.keys(knownSessions)) {
+      const tmuxName = `${SESSION_PREFIX}${sessionId}`;
+      if (!tmuxSessionExists(tmuxName)) {
+        delete knownSessions[sessionId];
+        cleanedCount++;
+      }
+    }
+
+    if (cleanedCount > 0) {
+      saveSessions(knownSessions);
+      console.log(`  ✓ Cleaned up ${cleanedCount} dead session(s) from file`);
+    }
+
+    if (killedCount > 0 || cleanedCount > 0) {
+      console.log(`  ✓ Session cleanup complete (killed: ${killedCount}, cleaned: ${cleanedCount})`);
+    }
+  } catch (err) {
+    console.error(`  ⚠ Session cleanup error: ${err.message}`);
+  }
+}
+
+// Create a new terminal session
+async function createTerminalSession(cwd = process.cwd(), name = null) {
+  if (!isTmuxAvailable()) {
+    throw new Error("tmux is not installed");
+  }
+  if (!isTtydAvailable()) {
+    throw new Error("ttyd is not installed");
+  }
+
+  const sessionId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
+  const tmuxName = `${SESSION_PREFIX}${sessionId}`;
+  const resolvedCwd = path.resolve(cwd);
+
+  // Find free port, excluding ports already allocated
+  const usedPorts = getUsedPorts();
+  let port;
+  const net = await import("net");
+  for (port = TTYD_PORT_MIN; port <= TTYD_PORT_MAX; port++) {
+    // Skip ports already allocated to existing sessions
+    if (usedPorts.has(port)) {
+      continue;
+    }
+    try {
+      await new Promise((resolve, reject) => {
+        const server = net.createServer();
+        server.once("error", reject);
+        server.once("listening", () => {
+          server.close();
+          resolve();
+        });
+        server.listen(port);
+      });
+      break;
+    } catch {
+      continue;
+    }
+  }
+
+  if (port > TTYD_PORT_MAX) {
+    throw new Error("No free ports available");
+  }
+
+  // Detect shell
+  const shell = process.env.SHELL || "/bin/bash";
+
+  // Create tmux session with interactive shell
+  execSync(`tmux new-session -d -s ${tmuxName} -c "${resolvedCwd}" "${shell}"`, { stdio: "pipe" });
+
+  // Start ttyd with iframe support
+  const ttydProcess = spawn("ttyd", [
+    "-p", port.toString(),
+    "-t", // Single client mode
+    "-O", // Allow any origin for iframe
+    "-W", // Enable flow control (needed for typing to work)
+    "tmux", "attach", "-t", tmuxName
+  ], {
+    detached: true,
+    stdio: "ignore"
+  });
+  ttydProcess.unref();
+
+  // Wait for ttyd to start
+  await new Promise(resolve => setTimeout(resolve, 500));
+
+  // Save session
+  const sessions = loadSessions();
+  const displayName = name || `Terminal ${Object.keys(sessions).length + 1}`;
+  sessions[sessionId] = {
+    tmuxName,
+    port,
+    ttydPid: ttydProcess.pid,
+    createdAt: new Date().toISOString(),
+    cwd: resolvedCwd,
+    displayName,
+  };
+  saveSessions(sessions);
+
+  return {
+    sessionId,
+    displayName,
+    url: `http://localhost:${port}`,
+    port,
+    createdAt: sessions[sessionId].createdAt,
+    cwd: resolvedCwd,
+  };
+}
+
+// Kill a terminal session
+function killTerminalSession(sessionId) {
+  const sessions = loadSessions();
+  const data = sessions[sessionId];
+
+  if (!data) {
+    return { success: false, error: "Session not found" };
+  }
+
+  // Kill ttyd
+  if (data.ttydPid) {
+    try {
+      process.kill(data.ttydPid, "SIGTERM");
+    } catch {}
+  }
+
+  // Kill tmux session
+  const tmuxName = `${SESSION_PREFIX}${sessionId}`;
+  if (tmuxSessionExists(tmuxName)) {
+    try {
+      execSync(`tmux kill-session -t ${tmuxName}`, { stdio: "pipe" });
+    } catch {}
+  }
+
+  // Remove from sessions
+  delete sessions[sessionId];
+  saveSessions(sessions);
+
+  return { success: true, sessionId };
+}
 
 // ── Suggested prompt ──────────────────────────────────────────────────────────
 
@@ -38,6 +369,9 @@ function getSuggestedPrompt(projectName, projectType, projectDir) {
 function buildPage({ projectDir, projectName, projectSlug, projectType, fileCount, configPath, shadow, watcherOk, port }) {
   const prompt   = getSuggestedPrompt(projectName, projectType, projectDir);
   const shadowOk = shadow?.ok;
+  const tmuxOk = isTmuxAvailable();
+  const ttydOk = isTtydAvailable();
+  const prerequisitesOk = tmuxOk && ttydOk;
 
   return `<!DOCTYPE html>
 <html lang="en">
@@ -73,7 +407,7 @@ function buildPage({ projectDir, projectName, projectSlug, projectType, fileCoun
       background-size: 40px 40px; opacity: 0.18; pointer-events: none; z-index: 0;
     }
     .wrap {
-      position: relative; z-index: 1; width: 100%; max-width: 680px;
+      position: relative; z-index: 1; width: 100%; max-width: 1200px;
       display: flex; flex-direction: column; gap: 20px;
     }
 
@@ -114,6 +448,7 @@ function buildPage({ projectDir, projectName, projectSlug, projectType, fileCoun
     .badge { font-size: 10px; padding: 2px 8px; border-radius: 99px; letter-spacing: .06em; font-family: var(--mono); }
     .badge-green { background: var(--green-dim); border: 1px solid #3ddc8440; color: var(--green); }
     .badge-amber { background: var(--amber-dim); border: 1px solid #f4b94240; color: var(--amber); }
+    .badge-red { background: var(--red-dim); border: 1px solid #ff5f5740; color: var(--red); }
 
     .meta-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
     .meta-item label {
@@ -125,6 +460,126 @@ function buildPage({ projectDir, projectName, projectSlug, projectType, fileCoun
     .meta-item .value.green  { color: var(--green); }
     .meta-item .value.muted  { color: var(--muted); }
     .meta-item.full { grid-column: 1/-1; }
+
+    /* ── Terminals ── */
+    .terminals-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(600px, 1fr));
+      gap: 20px;
+    }
+    .terminal-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+    }
+    .terminal-header {
+      padding: 10px 16px;
+      background: var(--surface2);
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      font-family: var(--mono);
+      font-size: 12px;
+    }
+    .terminal-title {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .terminal-status {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+    }
+    .terminal-status.alive { background: var(--green); }
+    .terminal-status.dead { background: var(--red); }
+    .terminal-actions {
+      display: flex;
+      gap: 8px;
+    }
+    .terminal-btn {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      color: var(--muted);
+      font-family: var(--mono);
+      font-size: 10px;
+      padding: 4px 10px;
+      border-radius: 4px;
+      cursor: pointer;
+      transition: all .15s;
+      text-decoration: none;
+    }
+    .terminal-btn:hover {
+      border-color: var(--accent);
+      color: var(--accent);
+    }
+    .terminal-btn.danger:hover {
+      border-color: var(--red);
+      color: var(--red);
+    }
+    .terminal-iframe-container {
+      position: relative;
+      height: 400px;
+      background: #0a0a0c;
+      overflow: hidden;
+    }
+    .terminal-iframe {
+      width: 100%;
+      height: 100%;
+      border: none;
+      display: block;
+    }
+    .terminal-info {
+      padding: 8px 16px;
+      background: var(--surface2);
+      border-top: 1px solid var(--border);
+      font-family: var(--mono);
+      font-size: 11px;
+      color: var(--muted);
+      display: flex;
+      gap: 16px;
+    }
+    .create-terminal-btn {
+      background: var(--accent-dim);
+      border: 1px solid var(--accent);
+      color: var(--accent);
+      font-family: var(--mono);
+      font-size: 12px;
+      padding: 10px 20px;
+      border-radius: 8px;
+      cursor: pointer;
+      transition: all .15s;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .create-terminal-btn:hover {
+      background: var(--accent-glow);
+    }
+    .create-terminal-btn:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+    .terminals-empty {
+      text-align: center;
+      padding: 40px;
+      color: var(--muted);
+      font-family: var(--mono);
+    }
+    .prerequisites-error {
+      background: var(--red-dim);
+      border: 1px solid var(--red);
+      color: var(--red);
+      padding: 16px;
+      border-radius: 8px;
+      font-family: var(--mono);
+      font-size: 12px;
+      margin-bottom: 16px;
+    }
 
     /* ── Snapshot list ── */
     #snapshot-list { display: flex; flex-direction: column; gap: 1px; }
@@ -210,72 +665,6 @@ function buildPage({ projectDir, projectName, projectSlug, projectType, fileCoun
 
     .footer { text-align: center; font-size: 12px; color: var(--muted); font-family: var(--mono); padding-top: 8px; }
 
-    /* ── Terminal Logs ── */
-    .terminal-logs-container {
-      max-height: 400px;
-      overflow-y: auto;
-      background: #0a0a0c;
-      font-family: var(--mono);
-      font-size: 12px;
-    }
-    .terminal-logs-container::-webkit-scrollbar { width: 6px; }
-    .terminal-logs-container::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
-    .terminal-logs {
-      padding: 12px 16px;
-    }
-    .log-entry {
-      display: flex;
-      gap: 12px;
-      padding: 6px 0;
-      border-bottom: 1px solid #1a1a1f;
-      line-height: 1.5;
-    }
-    .log-entry:last-child { border-bottom: none; }
-    .log-time {
-      color: #555;
-      flex-shrink: 0;
-      width: 60px;
-    }
-    .log-type {
-      flex-shrink: 0;
-      width: 60px;
-      text-transform: uppercase;
-      font-size: 10px;
-      padding: 2px 6px;
-      border-radius: 3px;
-      text-align: center;
-    }
-    .log-type.session { background: #7c6af720; color: #7c6af7; }
-    .log-type.mode { background: #f4b94220; color: #f4b942; }
-    .log-type.cmd { background: #3ddc8420; color: #3ddc84; }
-    .log-type.out { background: #2a2a32; color: #888; }
-    .log-type.err { background: #ff5f5720; color: #ff5f57; }
-    .log-type.state { background: #4ecdc420; color: #4ecdc4; }
-    .log-data {
-      flex: 1;
-      color: #b0b0c0;
-      word-break: break-word;
-      white-space: pre-wrap;
-    }
-    .log-data .mode-pty { color: #3ddc84; font-weight: 500; }
-    .log-data .mode-fallback { color: #f4b942; font-weight: 500; }
-    .clear-logs-btn {
-      background: var(--surface2);
-      border: 1px solid var(--border);
-      color: var(--muted);
-      font-family: var(--mono);
-      font-size: 11px;
-      padding: 4px 10px;
-      border-radius: 6px;
-      cursor: pointer;
-      transition: all .15s;
-    }
-    .clear-logs-btn:hover {
-      background: var(--red-dim);
-      border-color: var(--red);
-      color: var(--red);
-    }
-
     .wrap > * { animation: fadein .4s ease both; }
     .wrap > *:nth-child(1){animation-delay:.00s} .wrap > *:nth-child(2){animation-delay:.08s}
     .wrap > *:nth-child(3){animation-delay:.16s} .wrap > *:nth-child(4){animation-delay:.24s}
@@ -306,25 +695,34 @@ function buildPage({ projectDir, projectName, projectSlug, projectType, fileCoun
         <div class="meta-item"><label>Files</label><div class="value green">${fileCount} detected</div></div>
         <div class="meta-item"><label>Config written</label><div class="value green">✓ done</div></div>
         <div class="meta-item full"><label>Project path</label><div class="value muted">${projectDir}</div></div>
-        <div class="meta-item full"><label>Session data</label><div class="value muted">~/.claude-web/${projectSlug}/</div></div>
+        <div class="meta-item full"><label>Session data</label><div class="value muted">~/.claude-desktop-code/${projectSlug}/</div></div>
       </div>
     </div>
   </div>
 
-  <!-- Terminal Logs -->
+  <!-- Live Terminals -->
   <div class="card">
     <div class="card-header">
-      Terminal Logs
+      <span>Live Terminals</span>
       <div style="display:flex;gap:8px;align-items:center;">
-        <span class="badge badge-green" id="terminal-mode-badge">Loading…</span>
-        <button class="clear-logs-btn" id="clear-logs-btn" title="Clear logs">Clear</button>
+        <span class="badge ${prerequisitesOk ? 'badge-green' : 'badge-amber'}" id="terminal-prereq-badge">
+          ${prerequisitesOk ? '● Ready' : '● Prerequisites missing'}
+        </span>
+        <button class="create-terminal-btn" id="create-terminal-btn" ${!prerequisitesOk ? 'disabled' : ''}>
+          <span>+</span> New Terminal
+        </button>
       </div>
     </div>
-    <div class="card-body" style="padding:0;">
-      <div class="terminal-logs-container">
-        <div id="terminal-logs-list" class="terminal-logs">
-          <div class="snap-loading">Loading terminal logs…</div>
-        </div>
+    <div class="card-body" style="padding:20px;">
+      ${!prerequisitesOk ? `
+      <div class="prerequisites-error">
+        <strong>Missing prerequisites:</strong><br>
+        ${!tmuxOk ? '• tmux is not installed (brew install tmux)<br>' : ''}
+        ${!ttydOk ? '• ttyd is not installed (brew install ttyd)<br>' : ''}
+      </div>
+      ` : ''}
+      <div id="terminals-container">
+        <div class="terminals-empty">No active terminals. Click "New Terminal" to create one.</div>
       </div>
     </div>
   </div>
@@ -364,7 +762,7 @@ function buildPage({ projectDir, projectName, projectSlug, projectType, fileCoun
     ${shadowOk ? `<div class="step done">
       <div class="step-num">✓</div>
       <div class="step-text">Shadow git initialised
-        <span>~/.claude-web/${projectSlug}/shadow.git${watcherOk ? " · commits after 15s silence" : ""}</span>
+        <span>~/.claude-desktop-code/${projectSlug}/shadow.git${watcherOk ? " · commits after 15s silence" : ""}</span>
       </div>
     </div>` : ""}
     <div class="step">
@@ -400,6 +798,7 @@ function buildPage({ projectDir, projectName, projectSlug, projectType, fileCoun
 <script>
 const PROMPT    = ${JSON.stringify(prompt)};
 const SHADOW_OK = ${shadowOk};
+const PREREQS_OK = ${prerequisitesOk};
 
 let toastTimer;
 function showToast(msg, type = "") {
@@ -410,7 +809,7 @@ function showToast(msg, type = "") {
   toastTimer = setTimeout(() => { el.className = ""; }, 3000);
 }
 
-document.getElementById("copy-prompt-btn").addEventListener("click", () => {
+document.getElementById("copy-prompt-btn")?.addEventListener("click", () => {
   navigator.clipboard.writeText(PROMPT).then(() => {
     const btn = document.getElementById("copy-prompt-btn");
     document.getElementById("copy-icon").textContent = "✓";
@@ -423,6 +822,167 @@ document.getElementById("copy-prompt-btn").addEventListener("click", () => {
     }, 2000);
   });
 });
+
+// ── Terminal Management ──────────────────────────────────────────────────────
+
+let terminals = [];
+let terminalCards = {}; // Keep track of rendered cards by sessionId
+
+function createTerminalCard(t) {
+  const div = document.createElement('div');
+  div.className = 'terminal-card';
+  div.dataset.sessionId = t.sessionId;
+  div.innerHTML = \`
+    <div class="terminal-header">
+      <div class="terminal-title">
+        <span class="terminal-status \${t.isAlive ? 'alive' : 'dead'}"></span>
+        <span class="terminal-name">\${t.displayName}</span>
+      </div>
+      <div class="terminal-actions">
+        <a href="\${t.url}" target="_blank" class="terminal-btn">Open ↗</a>
+        <button class="terminal-btn danger kill-btn" data-session-id="\${t.sessionId}">Kill</button>
+      </div>
+    </div>
+    <div class="terminal-iframe-container">
+      <iframe class="terminal-iframe" src="\${t.url}" allow="fullscreen"></iframe>
+    </div>
+    <div class="terminal-info">
+      <span class="terminal-port">Port: \${t.port}</span>
+      <span class="terminal-cwd">CWD: \${t.cwd}</span>
+      <span class="terminal-created">Created: \${new Date(t.createdAt).toLocaleTimeString()}</span>
+    </div>
+  \`;
+
+  // Add kill handler
+  div.querySelector('.kill-btn').addEventListener('click', (e) => {
+    e.preventDefault();
+    killTerminal(t.sessionId);
+  });
+
+  return div;
+}
+
+function updateTerminalCard(card, t) {
+  // Only update status indicator, don't touch iframe
+  const status = card.querySelector('.terminal-status');
+  if (status) {
+    status.className = 'terminal-status ' + (t.isAlive ? 'alive' : 'dead');
+  }
+}
+
+function renderTerminals() {
+  const container = document.getElementById("terminals-container");
+
+  if (terminals.length === 0) {
+    container.innerHTML = '<div class="terminals-empty">No active terminals. Click "New Terminal" to create one.</div>';
+    terminalCards = {};
+    return;
+  }
+
+  // Check if we need to create the grid container
+  let grid = container.querySelector('.terminals-grid');
+  if (!grid) {
+    container.innerHTML = '<div class="terminals-grid"></div>';
+    grid = container.querySelector('.terminals-grid');
+    terminalCards = {};
+  }
+
+  // Get current session IDs
+  const currentIds = new Set(terminals.map(t => t.sessionId));
+
+  // Remove cards for dead/removed sessions
+  for (const id of Object.keys(terminalCards)) {
+    if (!currentIds.has(id)) {
+      terminalCards[id].remove();
+      delete terminalCards[id];
+    }
+  }
+
+  // Add or update cards
+  for (const t of terminals) {
+    if (terminalCards[t.sessionId]) {
+      // Update existing card (only status, don't touch iframe)
+      updateTerminalCard(terminalCards[t.sessionId], t);
+    } else {
+      // Create new card
+      const card = createTerminalCard(t);
+      grid.appendChild(card);
+      terminalCards[t.sessionId] = card;
+    }
+  }
+}
+
+async function fetchTerminals() {
+  try {
+    const response = await fetch("/api/terminals");
+    const data = await response.json();
+    // Only update if list changed
+    const newTerminals = data.terminals || [];
+    const currentIds = terminals.map(t => t.sessionId).sort().join(',');
+    const newIds = newTerminals.map(t => t.sessionId).sort().join(',');
+
+    if (currentIds !== newIds || JSON.stringify(terminals) !== JSON.stringify(newTerminals)) {
+      terminals = newTerminals;
+      renderTerminals();
+    }
+  } catch (err) {
+    console.error("Failed to fetch terminals:", err);
+  }
+}
+
+async function createTerminal() {
+  if (!PREREQS_OK) {
+    showToast("Prerequisites not met", "error");
+    return;
+  }
+
+  const btn = document.getElementById("create-terminal-btn");
+  btn.disabled = true;
+  btn.innerHTML = "<span>...</span> Creating...";
+
+  try {
+    const response = await fetch("/api/terminals", { method: "POST" });
+    const data = await response.json();
+
+    if (data.success) {
+      showToast("Terminal created", "success");
+      await fetchTerminals();
+    } else {
+      showToast("Failed: " + data.error, "error");
+    }
+  } catch (err) {
+    showToast("Failed to create terminal", "error");
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = "<span>+</span> New Terminal";
+  }
+}
+
+async function killTerminal(sessionId) {
+  if (!confirm("Kill this terminal?")) return;
+
+  try {
+    const response = await fetch(\`/api/terminals/\${sessionId}\`, { method: "DELETE" });
+    const data = await response.json();
+
+    if (data.success) {
+      showToast("Terminal killed", "success");
+      await fetchTerminals();
+    } else {
+      showToast("Failed: " + data.error, "error");
+    }
+  } catch (err) {
+    showToast("Failed to kill terminal", "error");
+  }
+}
+
+document.getElementById("create-terminal-btn")?.addEventListener("click", createTerminal);
+
+// Initial fetch and periodic refresh
+fetchTerminals();
+setInterval(fetchTerminals, 5000);
+
+// ── Snapshots ────────────────────────────────────────────────────────────────
 
 if (SHADOW_OK) {
   let lastCount = 0;
@@ -513,119 +1073,6 @@ if (SHADOW_OK) {
   fetchSnapshots();
   setInterval(fetchSnapshots, 5000);
 }
-
-// ── Terminal Logs ───────────────────────────────────────────────────────────
-let lastLogCount = 0;
-
-function getTypeClass(type) {
-  switch (type) {
-    case 'session_start':
-    case 'session_kill': return 'session';
-    case 'mode_switch': return 'mode';
-    case 'command': return 'cmd';
-    case 'output': return 'out';
-    case 'error': return 'err';
-    case 'state_change': return 'state';
-    default: return 'out';
-  }
-}
-
-function getTypeLabel(type) {
-  switch (type) {
-    case 'session_start': return 'SESSION';
-    case 'session_kill': return 'KILL';
-    case 'mode_switch': return 'MODE';
-    case 'command': return 'CMD';
-    case 'output': return 'OUT';
-    case 'error': return 'ERR';
-    case 'state_change': return 'STATE';
-    default: return type.toUpperCase();
-  }
-}
-
-function formatLogData(entry) {
-  switch (entry.type) {
-    case 'session_start':
-      return 'Started (mode: <span class="mode-' + entry.mode + '">' + entry.mode + '</span>, shell: ' + entry.shell + ')';
-    case 'mode_switch':
-      return 'Switched to <span class="mode-' + entry.mode + '">' + entry.mode + '</span> (' + entry.reason + ')';
-    case 'command':
-      return '<span class="mode-' + entry.mode + '">[' + entry.mode + ']</span> ' + entry.command;
-    case 'output':
-      const preview = entry.stdout?.substring(0, 80)?.replace(/\\n/g, '\\\\n') || '(no output)';
-      return 'Exit: ' + entry.exitCode + ' | ' + preview + (entry.stdout?.length > 80 ? '...' : '');
-    case 'error':
-      return entry.message;
-    case 'state_change':
-      return entry.change + ': ' + entry.value;
-    default:
-      return JSON.stringify(entry);
-  }
-}
-
-function renderTerminalLogs(logs) {
-  const container = document.getElementById("terminal-logs-list");
-  const badge = document.getElementById("terminal-mode-badge");
-
-  if (!logs.entries || logs.entries.length === 0) {
-    container.innerHTML = '<div class="snap-empty">No terminal logs yet — execute commands to see logs here.</div>';
-    return;
-  }
-
-  // Find current mode from most recent session_start or mode_switch
-  let currentMode = 'unknown';
-  for (let i = logs.entries.length - 1; i >= 0; i--) {
-    const e = logs.entries[i];
-    if (e.type === 'session_start') {
-      currentMode = e.mode;
-      break;
-    }
-    if (e.type === 'mode_switch') {
-      currentMode = e.mode;
-      break;
-    }
-  }
-
-  if (badge) {
-    badge.textContent = currentMode === 'pty' ? '● PTY mode' : (currentMode === 'fallback' ? '● Fallback mode' : '● No session');
-    badge.className = 'badge ' + (currentMode === 'pty' ? 'badge-green' : (currentMode === 'fallback' ? 'badge-amber' : 'badge-amber'));
-  }
-
-  container.innerHTML = logs.entries.map(function(e) {
-    const time = new Date(e.timestamp).toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
-    return '<div class="log-entry">' +
-      '<div class="log-time">' + time + '</div>' +
-      '<div class="log-type ' + getTypeClass(e.type) + '">' + getTypeLabel(e.type) + '</div>' +
-      '<div class="log-data">' + formatLogData(e) + '</div>' +
-    '</div>';
-  }).join('');
-
-  // Auto-scroll to bottom
-  container.scrollTop = container.scrollHeight;
-}
-
-async function fetchTerminalLogs() {
-  try {
-    const logs = await fetch("/api/terminal-logs").then(r => r.json());
-    if (logs.count !== lastLogCount) {
-      lastLogCount = logs.count;
-      renderTerminalLogs(logs);
-    }
-  } catch {}
-}
-
-document.getElementById("clear-logs-btn")?.addEventListener("click", async () => {
-  if (!confirm("Clear all terminal logs?")) return;
-  try {
-    await fetch("/api/terminal-logs/clear", { method: "POST" });
-    lastLogCount = 0;
-    document.getElementById("terminal-logs-list").innerHTML = '<div class="snap-empty">Logs cleared.</div>';
-    document.getElementById("terminal-mode-badge").textContent = 'Loading…';
-  } catch {}
-});
-
-fetchTerminalLogs();
-setInterval(fetchTerminalLogs, 2000);
 </script>
 </body>
 </html>`;
@@ -635,9 +1082,48 @@ setInterval(fetchTerminalLogs, 2000);
 
 export async function startServer(opts) {
   const { port, snapshotApi } = opts;
+
+  // Check prerequisites first
+  console.log("  → Checking prerequisites...");
+  checkPrerequisites();
+
+  // Clean up orphaned sessions on startup
+  console.log("  → Cleaning up orphaned sessions...");
+  cleanupOrphanedSessions();
+
   const shell = buildPage(opts);
 
   const server = http.createServer((req, res) => {
+    // Terminal sessions API
+    if (req.method === "GET" && req.url === "/api/terminals") {
+      const terminals = getTerminalSessions();
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ terminals }));
+      return;
+    }
+
+    if (req.method === "POST" && req.url === "/api/terminals") {
+      createTerminalSession(process.cwd(), null)
+        .then(session => {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ success: true, session }));
+        })
+        .catch(err => {
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ success: false, error: err.message }));
+        });
+      return;
+    }
+
+    if (req.method === "DELETE" && req.url.startsWith("/api/terminals/")) {
+      const sessionId = req.url.slice("/api/terminals/".length);
+      const result = killTerminalSession(sessionId);
+      res.writeHead(result.success ? 200 : 404, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(result));
+      return;
+    }
+
+    // Snapshots API
     if (req.method === "GET" && req.url === "/api/snapshots") {
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify(snapshotApi ? snapshotApi.listSnapshots() : []));
@@ -673,6 +1159,7 @@ export async function startServer(opts) {
       return;
     }
 
+    // Terminal logs API (legacy)
     if (req.method === "GET" && req.url === "/api/terminal-logs") {
       const logs = getTerminalLogs({ limit: 100 });
       res.writeHead(200, { "Content-Type": "application/json" });
@@ -681,20 +1168,43 @@ export async function startServer(opts) {
     }
 
     if (req.method === "POST" && req.url === "/api/terminal-logs/clear") {
-      const logs = getTerminalLogs({ clear: true });
+      getTerminalLogs({ clear: true });
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ ok: true, cleared: true }));
       return;
     }
 
+    // Main page
     res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
     res.end(shell);
   });
 
   server.listen(port);
 
-  process.on("SIGINT", () => {
-    console.log("\n  ✦ Stopped. Session data kept in ~/.claude-web/\n");
+  process.on("SIGINT", async () => {
+    console.log("\n  ✦ Stopped. Session data kept in ~/.claude-desktop-code/\n");
+    // Clean up terminal sessions on exit
+    try {
+      // Kill ttyd processes
+      spawn("pkill", ["-f", "ttyd.*claude-term-"], { stdio: "pipe" });
+      // Kill tmux sessions
+      const result = spawn("tmux", ["ls", "-F", "#{session_name}"], {
+        encoding: "utf-8",
+        stdio: ["pipe", "pipe", "pipe"]
+      });
+      if (result.status === 0 && result.stdout) {
+        const sessions = result.stdout.trim().split("\n").filter(Boolean);
+        const ourSessions = sessions.filter(name => name.startsWith("claude-term-"));
+        for (const tmuxName of ourSessions) {
+          try {
+            spawn("tmux", ["kill-session", "-t", tmuxName], { stdio: "pipe" });
+          } catch {}
+        }
+        if (ourSessions.length > 0) {
+          console.log(`  ✓ Cleaned up ${ourSessions.length} terminal session(s)`);
+        }
+      }
+    } catch {}
     process.exit(0);
   });
 }

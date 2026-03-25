@@ -51,12 +51,17 @@ function detectProjectType(dir) {
 const TERMINAL_MCP_DIR = path.join(GLOBAL_DIR, "terminal-mcp");
 const TERMINAL_MCP_SCRIPT = path.join(TERMINAL_MCP_DIR, "terminal-mcp.js");
 const TERMINAL_MCP_PKG = path.join(TERMINAL_MCP_DIR, "package.json");
+const SESSIONS_FILE = path.join(GLOBAL_DIR, "terminal-sessions.json");
 
 function getTerminalMcpSourcePath() {
   try {
     const cliDir = path.dirname(new URL(import.meta.url).pathname);
-    const srcPath = path.join(cliDir, "..", "src", "terminal-mcp.js");
+    // Use the new ttyd-tmux based terminal MCP
+    const srcPath = path.join(cliDir, "..", "src", "ttyd-tmux-terminal-mcp.js");
     if (fs.existsSync(srcPath)) return srcPath;
+    // Fallback to old terminal-mcp if new one doesn't exist
+    const fallbackPath = path.join(cliDir, "..", "src", "terminal-mcp.js");
+    if (fs.existsSync(fallbackPath)) return fallbackPath;
   } catch {}
   return null;
 }
@@ -461,6 +466,48 @@ function runStatus() {
   console.log("\n  " + "─".repeat(50) + "\n");
 }
 
+// ── Terminal Session Cleanup ──────────────────────────────────────────────────
+
+function cleanTerminalSessions() {
+  console.log("  → Cleaning up terminal sessions...");
+
+  // Kill all ttyd processes started by us
+  try {
+    spawnSync("pkill", ["-f", "ttyd.*claude-term-"], { stdio: "pipe" });
+  } catch {}
+
+  // Kill all tmux sessions with our prefix
+  try {
+    const result = spawnSync("tmux", ["ls", "-F", "#{session_name}"], {
+      encoding: "utf-8",
+      stdio: ["pipe", "pipe", "pipe"]
+    });
+
+    if (result.status === 0 && result.stdout) {
+      const sessions = result.stdout.trim().split("\n").filter(Boolean);
+      const ourSessions = sessions.filter(name => name.startsWith("claude-term-"));
+
+      for (const tmuxName of ourSessions) {
+        try {
+          spawnSync("tmux", ["kill-session", "-t", tmuxName], { stdio: "pipe" });
+        } catch {}
+      }
+
+      if (ourSessions.length > 0) {
+        console.log(`  ✓ Killed ${ourSessions.length} tmux session(s)`);
+      }
+    }
+  } catch {}
+
+  // Remove sessions file
+  if (fs.existsSync(SESSIONS_FILE)) {
+    try {
+      fs.unlinkSync(SESSIONS_FILE);
+      console.log("  ✓ Removed terminal sessions file");
+    } catch {}
+  }
+}
+
 // ── Clean ─────────────────────────────────────────────────────────────────────
 
 function runClean() {
@@ -469,11 +516,15 @@ function runClean() {
   // Kill running terminal-mcp processes
   console.log("  → Stopping terminal-mcp processes...");
   try {
+    spawnSync("pkill", ["-f", "ttyd-tmux-terminal-mcp.js"], { stdio: "pipe" });
     spawnSync("pkill", ["-f", "terminal-mcp.js"], { stdio: "pipe" });
     console.log("  ✓ Stopped terminal-mcp processes");
   } catch {
     // Ignore errors if no processes found
   }
+
+  // Clean up terminal sessions (tmux + ttyd)
+  cleanTerminalSessions();
 
   // Remove MCP server config from Claude Desktop
   const configPath = getClaudeConfigPath();
