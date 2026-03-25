@@ -165,7 +165,7 @@ function checkPrerequisites() {
   return false;
 }
 
-// Clean up orphaned tmux/ttyd sessions on startup
+// Clean up ALL tmux/ttyd sessions with our prefix on startup
 function cleanupOrphanedSessions() {
   try {
     // Get list of tmux sessions
@@ -175,24 +175,17 @@ function cleanupOrphanedSessions() {
     });
 
     const existingSessions = result.trim().split("\n").filter(Boolean);
+    // Find sessions with our prefix (claude-term-)
     const ourSessions = existingSessions.filter(name => name.startsWith(SESSION_PREFIX));
 
-    // Get sessions we know about
-    const knownSessions = loadSessions();
-    const knownTmuxNames = new Set(
-      Object.keys(knownSessions).map(id => `${SESSION_PREFIX}${id}`)
-    );
-
-    // Kill orphaned sessions (tmux sessions we didn't create)
+    // Kill ALL our tmux sessions (start fresh)
     let killedCount = 0;
     for (const tmuxName of ourSessions) {
-      if (!knownTmuxNames.has(tmuxName)) {
-        try {
-          execSync(`tmux kill-session -t ${tmuxName}`, { stdio: "pipe" });
-          killedCount++;
-          console.log(`  ✓ Killed orphaned tmux session: ${tmuxName}`);
-        } catch {}
-      }
+      try {
+        execSync(`tmux kill-session -t ${tmuxName}`, { stdio: "pipe" });
+        killedCount++;
+        console.log(`  ✓ Killed tmux session: ${tmuxName}`);
+      } catch {}
     }
 
     // Kill any orphaned ttyd processes
@@ -200,23 +193,32 @@ function cleanupOrphanedSessions() {
       execSync("pkill -f 'ttyd.*claude-term-'", { stdio: "pipe" });
     } catch {}
 
-    // Clean up sessions file - remove entries for dead tmux sessions
-    let cleanedCount = 0;
-    for (const sessionId of Object.keys(knownSessions)) {
-      const tmuxName = `${SESSION_PREFIX}${sessionId}`;
-      if (!tmuxSessionExists(tmuxName)) {
-        delete knownSessions[sessionId];
-        cleanedCount++;
+    // Clear sessions file since we killed everything
+    if (killedCount > 0) {
+      saveSessions({});
+      console.log(`  ✓ Cleared sessions file (killed ${killedCount} session(s))`);
+    }
+
+    // Clean up old wrapper scripts
+    const globalDir = path.dirname(SESSIONS_FILE);
+    try {
+      const files = fs.readdirSync(globalDir);
+      let cleanedScripts = 0;
+      for (const file of files) {
+        if (file.startsWith('.restricted-shell-') && file.endsWith('.sh')) {
+          try {
+            fs.unlinkSync(path.join(globalDir, file));
+            cleanedScripts++;
+          } catch {}
+        }
       }
-    }
+      if (cleanedScripts > 0) {
+        console.log(`  ✓ Cleaned up ${cleanedScripts} wrapper script(s)`);
+      }
+    } catch {}
 
-    if (cleanedCount > 0) {
-      saveSessions(knownSessions);
-      console.log(`  ✓ Cleaned up ${cleanedCount} dead session(s) from file`);
-    }
-
-    if (killedCount > 0 || cleanedCount > 0) {
-      console.log(`  ✓ Session cleanup complete (killed: ${killedCount}, cleaned: ${cleanedCount})`);
+    if (killedCount > 0) {
+      console.log(`  ✓ Session cleanup complete`);
     }
   } catch (err) {
     console.error(`  ⚠ Session cleanup error: ${err.message}`);
@@ -268,8 +270,61 @@ async function createTerminalSession(cwd = process.cwd(), name = null) {
   // Detect shell
   const shell = process.env.SHELL || "/bin/bash";
 
-  // Create tmux session with interactive shell
-  execSync(`tmux new-session -d -s ${tmuxName} -c "${resolvedCwd}" "${shell}"`, { stdio: "pipe" });
+  // Create a restricted shell wrapper that blocks cd outside project
+  const wrapperScript = path.join(GLOBAL_DIR, `.restricted-shell-${sessionId}.sh`);
+  const wrapperContent = `#!/bin/bash
+# Restricted shell wrapper for claude-desktop-code
+# Blocks navigation outside the project directory
+
+export PROJECT_ROOT="${resolvedCwd}"
+export PS1="[sandbox] $PS1"
+
+# Override cd to prevent escaping project directory
+cd() {
+  local target="$1"
+  if [ -z "$target" ]; then
+    target="$HOME"
+  fi
+
+  # Resolve absolute path
+  local abs_path
+  if [[ "$target" = /* ]]; then
+    abs_path="$target"
+  else
+    abs_path="$(pwd)/$target"
+  fi
+  abs_path="$(realpath -m "$abs_path" 2>/dev/null || echo "$abs_path")"
+
+  # Check if target is within project root
+  if [[ "$abs_path" != "$PROJECT_ROOT"* ]] && [[ "$abs_path" != "$PROJECT_ROOT" ]]; then
+    echo "❌ cd blocked: cannot navigate outside project directory" >&2
+    echo "   Project: $PROJECT_ROOT" >&2
+    echo "   Attempted: $abs_path" >&2
+    return 1
+  fi
+
+  # Check if directory exists
+  if [ ! -d "$abs_path" ]; then
+    echo "cd: no such file or directory: $target" >&2
+    return 1
+  fi
+
+  builtin cd "$abs_path"
+}
+
+# Start in project directory
+cd "$PROJECT_ROOT" 2>/dev/null || cd "${resolvedCwd}"
+
+# Execute the actual shell
+exec ${shell} "$@"
+`;
+
+  fs.mkdirSync(GLOBAL_DIR, { recursive: true });
+  fs.writeFileSync(wrapperScript, wrapperContent);
+  fs.chmodSync(wrapperScript, 0o755);
+
+  // Create tmux session with restricted shell wrapper
+  execSync(`tmux new-session -d -s ${tmuxName} -c "${resolvedCwd}" "${wrapperScript}"`, { stdio: "pipe" });
 
   // Start ttyd with iframe support
   const ttydProcess = spawn("ttyd", [
@@ -333,6 +388,12 @@ function killTerminalSession(sessionId) {
       execSync(`tmux kill-session -t ${tmuxName}`, { stdio: "pipe" });
     } catch {}
   }
+
+  // Clean up wrapper script
+  const wrapperScript = path.join(GLOBAL_DIR, `.restricted-shell-${sessionId}.sh`);
+  try {
+    fs.unlinkSync(wrapperScript);
+  } catch {}
 
   // Remove from sessions
   delete sessions[sessionId];
